@@ -17,7 +17,7 @@ Utils:
 - `plot_utils.py`: plot the 2D posteriors from samples
 - `sm_utils.py`: train function for `NSE` or `PF-NPSE` models
 
-SBI tasks in the `task` folder:
+SBI tasks:
 - Toy Example: 2D Gaussian Simulator and Uniform prior - infer the mean.
 
 Notebooks:
