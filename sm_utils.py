@@ -5,18 +5,34 @@ from tqdm import tqdm
 
 
 def train(
-    model, dataset, loss_fn, n_epochs=5000, lr=3e-4, batch_size=32, prior_score=False
+    model,
+    dataset,
+    loss_fn,
+    n_epochs=5000,
+    lr=3e-4,
+    batch_size=32,
+    classifier_free_guidance=0.0,
+    track_loss=False,
+    validation_split=0,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    dloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    ema_model = torch.optim.swa_utils.AveragedModel(
+        model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999)
+    )
+    # get train and validation loaders
+    train_loader, val_loader = get_dataloaders(
+        dataset, batch_size=batch_size, validation_split=validation_split
+    )
 
+    train_losses = []
+    val_losses = []
     with tqdm(range(n_epochs), desc="Training epochs") as tepoch:
         for _ in tepoch:
-            total_loss = 0
-            for data in dloader:
+            train_loss = 0
+            for data in train_loader:
                 # get batch data
                 if len(data) > 1:
-                    theta, x, kwargs_sn = get_batch_data(data, prior_score)
+                    theta, x, kwargs_sn = get_batch_data(data, classifier_free_guidance)
                     kwargs_sn["x"] = x
                 else:
                     theta = data[0]
@@ -26,11 +42,45 @@ def train(
                 loss = loss_fn(theta, **kwargs_sn)
                 loss.backward()
                 opt.step()
+                ema_model.update_parameters(model)
 
-                # running stats
-                total_loss = total_loss + loss.detach().item() * theta.shape[0]
+                # update loss
+                train_loss += loss.detach().item() * theta.shape[0]  # unnormalized loss
+            train_loss /= len(dataset) * (1 - validation_split)  # normalized loss
+            train_losses.append(train_loss)
 
-            tepoch.set_postfix(loss=total_loss / len(dataset))
+            # validation loop
+            if val_loader is not None:
+                with torch.no_grad():
+                    val_loss = 0
+                    for data in val_loader:
+                        # get batch data
+                        if len(data) > 1:
+                            theta, x, kwargs_sn = get_batch_data(
+                                data, classifier_free_guidance
+                            )
+                            kwargs_sn["x"] = x
+                        else:
+                            theta = data[0]
+                            kwargs_sn = {}
+                        # validation step
+                        loss = loss_fn(theta, **kwargs_sn)
+
+                        # update loss
+                        val_loss += (
+                            loss.detach().item() * theta.shape[0]
+                        )  # unnormalized loss
+                    val_loss /= len(dataset) * validation_split  # normalized loss
+                    val_losses.append(val_loss)
+
+                tepoch.set_postfix(train_loss=train_loss, val_loss=val_loss, lr=lr)
+            else:
+                tepoch.set_postfix(train_loss=train_loss, lr=lr)
+
+    if track_loss:
+        return ema_model, train_losses, val_losses
+    else:
+        return ema_model
 
 
 # Training with validation and early stopping as in
@@ -44,15 +94,13 @@ def train_with_validation(
     n_epochs=100,
     lr=1e-4,
     batch_size=128,
-    lr_decay=1e-2,
-    lr_update_freq=200,
-    validation_split=0.25,
+    lr_decay=1,
+    lr_update_freq=2000,
+    validation_split=0.2,
     early_stopping=False,
-    patience=1000,
-    prior_score=False,
-    save_path=None,
-    losses_filename="losses.pkl",
-    model_filename="score_network.pkl",
+    patience=20000,
+    min_nb_epochs=100,
+    classifier_free_guidance=False,
 ):
     # get train and validation loaders
     train_loader, val_loader = get_dataloaders(
@@ -61,6 +109,9 @@ def train_with_validation(
 
     # set up optimizer
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    ema_model = torch.optim.swa_utils.AveragedModel(
+        model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999)
+    )
 
     # start training
     train_losses, val_losses = [], []
@@ -70,7 +121,7 @@ def train_with_validation(
         for e in tepoch:
             # update learning rate
             # lr_e = update_lr(lr, lr_decay, e, n_epochs)
-            if (e + 1) % lr_update_freq == 0:
+            if (e + 1) % lr_update_freq == 0 and (lr_decay < 1):
                 lr = lr * lr_decay
                 set_lr(opt, lr)
 
@@ -78,13 +129,18 @@ def train_with_validation(
             train_loss = 0
             for data in train_loader:
                 # get batch data
-                theta, x, kwargs_sn = get_batch_data(data, prior_score)
-
+                if len(data) > 1:
+                    theta, x, kwargs_sn = get_batch_data(data, classifier_free_guidance)
+                    kwargs_sn["x"] = x
+                else:
+                    theta = data[0]
+                    kwargs_sn = {}
                 # training step
                 opt.zero_grad()
-                loss = loss_fn(theta, x, **kwargs_sn)
+                loss = loss_fn(theta, **kwargs_sn)
                 loss.backward()
                 opt.step()
+                ema_model.update_parameters(model)
 
                 # update loss
                 train_loss += loss.detach().item() * theta.shape[0]  # unnormalized loss
@@ -97,10 +153,16 @@ def train_with_validation(
                     val_loss = 0
                     for data in val_loader:
                         # get batch data
-                        theta, x, kwargs_sn = get_batch_data(data, prior_score)
-
+                        if len(data) > 1:
+                            theta, x, kwargs_sn = get_batch_data(
+                                data, classifier_free_guidance
+                            )
+                            kwargs_sn["x"] = x
+                        else:
+                            theta = data[0]
+                            kwargs_sn = {}
                         # validation step
-                        loss = loss_fn(theta, x, **kwargs_sn)
+                        loss = loss_fn(theta, **kwargs_sn)
 
                         # update loss
                         val_loss += (
@@ -108,42 +170,31 @@ def train_with_validation(
                         )  # unnormalized loss
                     val_loss /= len(dataset) * validation_split  # normalized loss
                     val_losses.append(val_loss)
-
-            tepoch.set_postfix(loss=train_loss, lr=lr)
+                tepoch.set_postfix(train_loss=train_loss, val_loss=val_loss, lr=lr)
+            else:
+                tepoch.set_postfix(loss=train_loss, lr=lr)
 
             # early stopping
             if early_stopping:
                 assert (
                     validation_split > 0
                 ), "validation data is required for early stopping"
-                if best_loss is None or val_loss < best_loss:
+                if best_loss is None or val_loss < best_loss and e > min_nb_epochs:
                     best_loss = val_loss
-                    best_model = model
+                    best_model = ema_model
                     best_epoch = e
                 elif e - best_epoch > patience:
                     break
 
         if early_stopping:
-            model = best_model
+            ema_model = best_model
             e = best_epoch
             print(
                 f"EARLY STOPPING: best validation loss {best_loss} at epoch {best_epoch}"
             )
             print("Did not improve for {} epochs".format(min(patience, n_epochs - e)))
 
-        # save losses and best model
-        if save_path is not None:
-            torch.save(
-                {
-                    "train_losses": train_losses,
-                    "val_losses": val_losses,
-                    "best_epoch": e,
-                },
-                save_path + losses_filename,
-            )
-            torch.save(model, save_path + model_filename)
-
-    return model
+    return ema_model, train_losses, val_losses, e
 
 
 def get_dataloaders(dataset, batch_size, validation_split):
@@ -175,7 +226,7 @@ def set_lr(optimizer, lr):
         param_group["lr"] = lr
 
 
-def get_batch_data(data, prior_score):
+def get_batch_data(data, clf_free_guidance):
     # default: npse without n
     theta, x = data[0], data[1]
     n = None
@@ -185,8 +236,9 @@ def get_batch_data(data, prior_score):
         n = data[2]
         kwargs_sn = {"n": n}
 
-    # learn diffused prior score: 20% of the time, set context to zero
-    if prior_score and random.random() < 0.2:
+    # to learn the diffused prior score via classifier free guidance:
+    # set context to zero 20% of the time
+    if random.random() < clf_free_guidance:
         x = torch.zeros_like(x)  # zero context
         kwargs_sn = {}
         if n is not None:
