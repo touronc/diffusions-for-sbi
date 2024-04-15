@@ -1,8 +1,6 @@
 # diffusions-for-sbi
 
-Offical Code for the paper "Diffusion posterior sampling for simulation-based inference in tall data settings".
-
-An updated version of the paper is available at `paper.pdf`. The figures from the paper can be found in the `figures/` folder. It contains folders corresponding to each experiments that respectively provide resutls for the Gaussian Toy examples (`toy_models/`), the SBI benchmark examples (`sbibm/`) examples and a real simulator from computational neuroscience (`jrnnm/`). 
+Offical Code for the paper ["Diffusion posterior sampling for simulation-based inference in tall data settings"](https://arxiv.org/abs/2404.07593).
 
 ## Requirements
 
@@ -24,8 +22,9 @@ The `environment.yml` file details the environment (packages and versions) used 
 
 ### Diffusion generative modeling and posterior sampling:
 - `nse.py`: implementation of the conditional neural score estimator class (`NSE`) and corresponding loss function (`NSELoss`). The `NSE` class has integrated *LANGEVIN*, *DDIM* and *Predictor-Corrector* samplers for single observation and tall posterior inference tasks. The `ddim` method combined with the `factorized_score` corresponds to our algorithm (`GAUSS` and `JAC`), the `annealed_langevin_geffner` method corresponds to the `F-NPSE` method from [Geffner et al., 2023](https://arxiv.org/abs/2209.14249).
+- `pf_nse.py` implements the partially factorized neural score estimator class (`PF_NSE`). It extends the `NSE` class to allow inputs with sets of context observations `x` with variable size (instead of single context observations). Existing samplers (e.g. `ddim`, `annealed_langevin_geffner`) are modified to split the context observations into sub sets of smaller size `n_max` before passing them to the `factorized_score` method, resulting in a "partially" factorized tall posterior sampler, such as `PF-NPSE` developped by [Geffner et al., 2023](https://arxiv.org/abs/2209.14249).
 - `sm_utils.py`: train function for `NSE`.
-- `tall_posterior_sampler.py`: implementation of our tall posterior sampler (`GAUSS` and `JAC` algorithms) and the `euler` sampler.
+- `tall_posterior_sampler.py`: utility functions (e.g. `tweedies_approximation`) for our tall posterior sampler (`GAUSS` and `JAC` algorithms).
 - `vp_diffused_priors.py`: analytic diffused (uniform and gaussian) prior for a VP-SDE diffusion process.
 
 ### Experiment utils:
@@ -38,6 +37,8 @@ Other files include the scripts to run experiments and reproduce the figures fro
 
 ## Reproduce experiments and figures from the paper
 
+All the figures from the paper can be found in the `figures/` folder. It contains folders corresponding to each experiments that respectively provide resutls for the Gaussian Toy examples (`toy_models/`), the SBI benchmark examples (`sbibm/`) examples and a real simulator from computational neuroscience (`jrnnm/`). 
+
 ### Toy Models (cf. Section 4.1):
 - To generate the raw data (samples and metadata), run the scripts `gen_gaussian_gaussian.py path_to_save` and `gen_mixt_gauss_gaussian.py path_to_save` where
 `path_to_save` is the path one wants to save the raw files.
@@ -45,11 +46,11 @@ Other files include the scripts to run experiments and reproduce the figures fro
 This will create CSV files in `path_to_save`.
 - To reproduce the results from the paper (with correct stlye) run the scripts `toy_example_gaussian_results.py path_to_save` and `toy_example_gaussian_mixture_results.py path_to_save`. The figures will be saved in the `figures/` folder and the time table datas in the `data/` folder in the `path_to_save` directory (here `results/toy_models/<gaussian/gaussian_mixture>/`).
 
-Figures can be found in the `figures/toy_models/` folder.
+Figures from the paper can be found in the `figures/toy_models/` folder.
 
 ### SBIBM examples (cf. Section 4.2):
 
-The script to reproduce experiments and generate figures are `sbibm_posterior_estomation.py` and `sbibm_results_rebuttal.py`. The tasks for which the results are shown in the main paper are `task_name = lotka_volterra`, `sir` and `slcp`. We also computes results for the following tasks: `gaussian_linear`, `gaussian_mixture/_uniform`, `bernoulli_glm/_raw`, `two_moons`. They will be included in the Appendix of the camera ready version of the paper.
+The script to reproduce experiments and generate figures are `sbibm_posterior_estomation.py` and `sbibm_results_rebuttal.py`. The tasks for which the results are shown in the main paper are `task_name = lotka_volterra`, `sir` and `slcp`. We also computes results for the following tasks: `gaussian_linear`, `gaussian_mixture/_uniform`, `bernoulli_glm/_raw`, `two_moons`. 
 
 - To generate the training and reference data/posterior samples run:
   ```
@@ -83,7 +84,7 @@ The script to reproduce experiments and generate figures are `sbibm_posterior_es
   
 - Use the `--losses` argument to plot the loss functions and the `--plot_samples` argument to visualize the reference and estimated posterior samples.
 
-Figures can be found in the `figures/sbibm/` folder with results for the main and additional tasks in the `main/` and `extra/` folders.
+Figures from the paper can be found in the `figures/sbibm/` folder with results for the main and additional tasks in the `main/` and `extra/` folders.
 
 ### JR-NMM example (cf. Section 4.3)
 
@@ -108,7 +109,7 @@ Two main features have been added:
 - **Classifier-free guidance:** it is possible to implicitly **learn the prior score** by randomly dropping the context variables during the training of the posterior score. This is useful in cases where the diffused prior score cannot be computed analytically. To do so, specify the "drop rate" in the `classifier_free_guidance` variable of the training function implemented in `sm_utils.py`.
 - **Partially factorized samplers:** `pf_nse.py` implements the `PF_NSE` class. It extends the `NSE` class to allow inputs with sets of context observations `x` with variable size (instead of single context observations). Existing samplers (e.g. `ddim`, `annealed_langevin_geffner`) are modified to split the context observations into sub sets of smaller size `n_max` before passing them to the factorized score methods, resulting in a "partially" factorized tall posterior sampler, such as `PF-NPSE` developped by [Geffner et al., 2023](https://arxiv.org/abs/2209.14249).
 
-These features were integrated into the scripts of the SBI benchmark experiment and results will be added to the Appendix of the paper. Figures can be found in the `figures/sbibm/classifier_free_guidance` and `figures/sbibm/pf_npse` folders.
+These features were integrated into the scripts of the SBI benchmark experiment and results will be added to the Appendix of the paper. Figures from the paper can be found in the `figures/sbibm/classifier_free_guidance` and `figures/sbibm/pf_npse` folders.
 
 - To learn the prior score while training the posterior score model and then use it for sampling the tall posterior, run the `sbibm_posterior_estimation.py` script as explained above, and add the `--clf_free_guidance` argument in the command line. To generate results (compute metrics and plot figures) run the `sbibm_results_rebuttal.py`, again with added `--clf_free_guidance` argument.
 - To reproduce the `PF-NSE` experiment, use the `scicm_pf_npse.py` script. Figures are obtained by running the `sbibm_results_rebuttal.py` script as explained above (to compute and plot distances) with additional argument `--pf_nse`.
@@ -119,4 +120,4 @@ During the rebuttal we were asked to address the limitations of Langevin Dynamic
 - To obtain samples with tamed ULA, specify `--langevin tamed` when running the `sbibm_posterior_estimation.py` script in addition to the other comand line arguments.
 - To reproduce the Figure from the paper, add the `--langevin_comparison` comand line argument when running `python sbibm_results_rebuttal.py` to compute and plot the sW and MMD distances between the estimated and true posterior samples.
 
-Figures can be found in the `figures/sbibm/langevin_comparison` folder.
+Figures from the paper can be found in the `figures/sbibm/langevin_comparison` folder.
