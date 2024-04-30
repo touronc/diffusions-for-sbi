@@ -18,8 +18,7 @@ from tqdm import tqdm
 from torch.func import vmap
 from zuko.nn import MLP
 
-# from debug_learned_uniform import diffused_tall_posterior_score, euler_sde_sampler
-from tall_posterior_sampler import diffused_tall_posterior_score, euler_sde_sampler
+from tall_posterior_sampler import diffused_tall_posterior_score, euler_sde_sampler, tweedies_approximation
 from vp_diffused_priors import get_vpdiff_uniform_score
 
 # time
@@ -475,6 +474,7 @@ if __name__ == "__main__":
                 map_location=torch.device("cpu"),
             )
             score_network.net_type = "default"
+            score_network.tweedies_approximator = tweedies_approximation
 
             # Mean and std of training data
             means_stds_dict = torch.load(save_path + f"train_means_stds_dict.pkl")

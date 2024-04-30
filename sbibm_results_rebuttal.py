@@ -473,7 +473,7 @@ if __name__ == "__main__":
                                     pf_nse=args.pf_nse,
                                     n_max=n_max,
                                     metric=metric,
-                                    load=True,
+                                    load=False,
                                 )
                                 dist_mean = dist["mean"]
                                 dist_std = dist["std"]

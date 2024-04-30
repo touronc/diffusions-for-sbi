@@ -10,7 +10,7 @@ from torch.func import vmap
 # from zuko.nn import MLP
 
 from tasks.sbibm import get_task
-from tall_posterior_sampler import diffused_tall_posterior_score, euler_sde_sampler
+from tall_posterior_sampler import diffused_tall_posterior_score, euler_sde_sampler, tweedies_approximation
 from vp_diffused_priors import get_vpdiff_gaussian_score, get_vpdiff_uniform_score
 
 PATH_EXPERIMENT = "results/sbibm/"
@@ -70,7 +70,7 @@ def run_train_sgm(
     # Set Device
     device = "cpu"
     if torch.cuda.is_available():
-        device = "cuda:2"
+        device = "cuda:1"
 
     # Prepare training data
     # normalize theta
@@ -169,7 +169,7 @@ def run_sample_sgm(
     # Set Device
     device = "cpu"
     if torch.cuda.is_available():
-        device = "cuda:2"
+        device = "cuda:1"
 
     n_obs = context.shape[0]
 
@@ -565,6 +565,7 @@ if __name__ == "__main__":
                 map_location=torch.device("cpu"),
             )
             score_network.net_type = "default"
+            score_network.tweedies_approximator = tweedies_approximation
 
             # Mean and std of training data
             means_stds_dict = torch.load(save_path + f"train_means_stds_dict.pkl")
