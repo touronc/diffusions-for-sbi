@@ -1,8 +1,3 @@
-import sys
-
-sys.path.append("tasks/jrnnm/")
-
-import argparse
 import os
 import torch
 
@@ -298,6 +293,8 @@ def run_sample_sgm(
 
 
 if __name__ == "__main__":
+    import argparse
+    
     # Define Arguments
     parser = argparse.ArgumentParser()
     parser.add_argument(
