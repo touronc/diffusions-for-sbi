@@ -60,7 +60,7 @@ if __name__ == "__main__":
     torch.manual_seed(1)
 
     all_exps = []
-    for DIM in [10, 50, 100]:
+    for DIM in [10]: #, 50, 100]:
         for eps in [0, 1e-3, 1e-2, 1e-1]:
             for seed in range(5):
                 # Simulator and observations
