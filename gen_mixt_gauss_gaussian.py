@@ -1,19 +1,15 @@
 # Script for the Gaissian Mixture toy example. Reproduces experiemnts from section 4.1 of the paper.
 
 import os
-import sys
-import time
-
 import torch
-from torch.func import grad, vmap
-from tqdm import tqdm
 
+from torch.func import vmap, grad
 from embedding_nets import EpsilonNet, FakeFNet
-from nse_toy import NSE
-from tall_posterior_sampler import mean_backward, prec_matrix_backward
-from tasks.toy_examples.data_generators import Gaussian_MixtGaussian_mD
 from vp_diffused_priors import get_vpdiff_gaussian_score
-
+from tqdm import tqdm
+from tasks.toy_examples.data_generators import Gaussian_MixtGaussian_mD
+import time
+from nse_toy import mean_backward, prec_matrix_backward
 
 # MALA sampler for true posterior
 def MALA(x, lr, logpdf_fun, n_iter):
@@ -54,6 +50,8 @@ def MALA(x, lr, logpdf_fun, n_iter):
 
 
 if __name__ == "__main__":
+    from nse_toy import NSE
+    import sys
     path_to_save = sys.argv[1]
     os.makedirs(path_to_save, exist_ok=True)
 
@@ -76,12 +74,12 @@ if __name__ == "__main__":
 
                 # True posterior score / epsilon network
                 score_net = NSE(theta_dim=DIM, x_dim=DIM) #, net_type="fnet")
-                beta_min = 0.1
-                beta_max = 40
-                beta_d = beta_max - beta_min
-                score_net.alpha = lambda t: torch.exp(
-                    -0.5 * 0.5 * beta_d * (t**2) + beta_min * t
-                )
+                # beta_min = 0.1
+                # beta_max = 40
+                # beta_d = beta_max - beta_min
+                # score_net.alpha = lambda t: torch.exp(
+                #     -0.5 * 0.5 * beta_d * (t**2) + beta_min * t
+                # )
 
                 def real_eps(theta, x, t):
                     score = vmap(
@@ -170,6 +168,7 @@ if __name__ == "__main__":
                             dist_cov_est=cov_est.cuda(),
                             cov_mode="GAUSS",
                         ).cpu()
+                        print(samples_gauss.isnan().sum())
 
                         tstart_jac = time.time()
                         # Sample with JAC
@@ -182,6 +181,7 @@ if __name__ == "__main__":
                             # prior=prior,
                             cov_mode="JAC",
                         ).cpu()
+                        print(samples_jac.isnan().sum())
 
                         tstart_lang = time.time()
                         # Sample with Langevin
@@ -193,6 +193,7 @@ if __name__ == "__main__":
                                 lsteps=5,
                                 steps=sampling_steps,
                             ).cpu()
+                            print(lang_samples.isnan().sum())
                         t_end_lang = time.time()
                         dt_gauss = tstart_jac - tstart_gauss
                         dt_jac = tstart_lang - tstart_jac
