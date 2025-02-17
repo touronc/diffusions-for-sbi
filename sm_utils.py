@@ -16,7 +16,7 @@ def train(
     validation_split=0,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    ema_model = torch.optim.swa_utils.AveragedModel(
+    ema_model = torch.optim.swa_utils.AveragedModel(#allow to compute running average of the parameters model
         model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999)
     )
     # get train and validation loaders
@@ -42,11 +42,11 @@ def train(
                 loss = loss_fn(theta, **kwargs_sn)
                 loss.backward()
                 opt.step()
-                ema_model.update_parameters(model)
+                ema_model.update_parameters(model) #update the parameters of the model by the average new parameters ?
 
                 # update loss
                 train_loss += loss.detach().item() * theta.shape[0]  # unnormalized loss
-            train_loss /= len(dataset) * (1 - validation_split)  # normalized loss
+            train_loss /= len(dataset) * (1 - validation_split)  # normalized loss over the trainset
             train_losses.append(train_loss)
 
             # validation loop
@@ -73,7 +73,7 @@ def train(
                     val_loss /= len(dataset) * validation_split  # normalized loss
                     val_losses.append(val_loss)
 
-                tepoch.set_postfix(train_loss=train_loss, val_loss=val_loss, lr=lr)
+                tepoch.set_postfix(train_loss=train_loss, val_loss=val_loss, lr=lr) #add info to display in terminal
             else:
                 tepoch.set_postfix(train_loss=train_loss, lr=lr)
 
@@ -110,8 +110,8 @@ def train_with_validation(
     # set up optimizer
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     ema_model = torch.optim.swa_utils.AveragedModel(
-        model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999)
-    )
+        model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.9999)
+    ) #allows to compute average of the parameters model
 
     # start training
     train_losses, val_losses = [], []
@@ -182,12 +182,12 @@ def train_with_validation(
                 if best_loss is None or val_loss < best_loss and e > min_nb_epochs:
                     best_loss = val_loss
                     best_model = ema_model
-                    best_epoch = e
-                elif e - best_epoch > patience:
+                    best_epoch = e #best_epoch is when the val loss is the smallest
+                elif e - best_epoch > patience:#if we keep training too long but still have no improvement, stop training
                     break
 
         if early_stopping:
-            ema_model = best_model
+            ema_model = best_model #keep the model with the smallest val loss and longer trained
             e = best_epoch
             print(
                 f"EARLY STOPPING: best validation loss {best_loss} at epoch {best_epoch}"

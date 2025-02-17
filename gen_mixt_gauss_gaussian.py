@@ -83,13 +83,13 @@ if __name__ == "__main__":
 
                 def real_eps(theta, x, t):
                     score = vmap(
-                        grad(
+                        grad( #diffused posterior returns analytical p_t(theta|x)
                             lambda theta, x, t: task.diffused_posterior(
                                 x, score_net.alpha(t)
                             ).log_prob(theta)
                         )
                     )(theta, x, t)
-                    return -score_net.sigma(t) * score
+                    return -score_net.sigma(t) * score #analytical score (eq 34 appendix D4)
 
                 # Perturbed score network
                 score_net.net = FakeFNet(
@@ -135,12 +135,13 @@ if __name__ == "__main__":
                     }
 
                     # Approximate posterior samples
-                    for sampling_steps, eta in zip(
+                    for sampling_steps, eta in zip( #eta is for DDIM sampling
                         [50, 150, 400, 1000][::-1], [0.2, 0.5, 0.8, 1][::-1]
                     ):
                         tstart_gauss = time.time()
                         # Estimate the Gaussian covariance
-                        samples_ddim = (
+                        #assume each true individual posterior is gaussian
+                        samples_ddim = ( #sample from the true posterior with reverse process
                             score_net.ddim(
                                 shape=(1000 * N_OBS,),
                                 x=x_obs_100[None, :N_OBS]
@@ -155,8 +156,8 @@ if __name__ == "__main__":
                             .cpu()
                         )
                         cov_est = vmap(lambda x: torch.cov(x.mT))(
-                            samples_ddim.permute(1, 0, 2)
-                        )
+                            samples_ddim.permute(1, 0, 2) #compute Sigma_j^-1 to use in GAUSS algo
+                        ) #they are used to compute Sigma_t,j^-1 for al t
                         # Sample with "GAUSS"
                         samples_gauss = score_net.ddim(
                             shape=(1000,),
@@ -172,6 +173,7 @@ if __name__ == "__main__":
 
                         tstart_jac = time.time()
                         # Sample with JAC
+                        #don't neefd to estimate cov of initial dataset
                         samples_jac = score_net.ddim(
                             shape=(1000,),
                             x=x_obs_100[:N_OBS].cuda(),

@@ -56,19 +56,19 @@ def get_vpdiff_gaussian_score(mean, cov, nse):
         # transition kernel p_{t|0}(theta_t) = N(theta_t | mu_t, sigma^2_t I)
         # with mu_t = theta * scaling_t
         scaling_t = nse.alpha(t) ** 0.5
-        sigma_t = nse.sigma(t)
+        sigma_t = nse.sigma(t) #(1-alpha_t)**0.5
 
         # from Bishop 2006 (2.115)
         # p_t(theta_t) = int p_{t|0}(theta_t|theta) p(theta)dtheta
         # = N(theta_t | scaling_t * mean, sigma^2_t I + scaling_t^2 * cov)
-        loc = scaling_t * mean
+        loc = scaling_t * mean #alpha_t**0.5 mu 
         covariance_matrix = (
             sigma_t**2 * torch.eye(theta.shape[-1], device=mean.device)
             + scaling_t**2 * cov
         )
 
         # grad_theta_t log N(theta_t | loc, cov) = - cov^{-1} * (theta_t - loc)
-        prior_score_t = -(theta - loc) @ torch.linalg.inv(covariance_matrix)
+        prior_score_t = -(theta - loc) @ torch.linalg.inv(covariance_matrix) #equation (25) appendix D
         return prior_score_t
 
     return vpdiff_gaussian_score

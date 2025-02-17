@@ -1,22 +1,30 @@
 import torch
 from torch import Tensor
+from zuko.utils import broadcast
+
 
 
 class PositionalEncodingVector(torch.nn.Module):
+     # for the time variable t
+     # inspired from the sinusoidal time embedding in DDPM+
     def __init__(self, d_model: int, M: int):
         super().__init__()
-        div_term = 1 / M ** (2 * torch.arange(0, d_model, 2) / d_model)
+        div_term = 1 / M ** (2 * torch.arange(0, d_model, 2) / d_model) #size of torch.arange
         self.register_buffer("div_term", div_term)
-
     def forward(self, x: Tensor) -> Tensor:
         """
         Arguments:
             x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
         """
-        exp_div_term = self.div_term.reshape(*(1,) * (len(x.shape) - 1), -1)
+        exp_div_term = self.div_term.reshape(*(1,) * (len(x.shape) - 1), -1) #reshape divterm as (1,dim(divterm))
+        tmp = exp_div_term * x[...,None]
+        #ATTENTION modification
         return torch.cat(
-            (torch.sin(x * exp_div_term), torch.cos(x * exp_div_term)), dim=-1
+            (torch.sin(tmp), torch.cos(tmp)), dim=-1
         )
+        # return torch.cat(
+        #     (torch.sin(x * exp_div_term), torch.cos(x * exp_div_term)), dim=-1
+        # ) #size = (nsample of x, dim divterm *2)
 
 
 class _FBlock(torch.nn.Module):
@@ -81,7 +89,6 @@ class FNet(torch.nn.Module):
             # torch.nn.Linear
         )
         self.cond_layer = torch.nn.Linear(dim_cond, dim_embedding)
-
         self.embedding_map = torch.nn.Sequential(
             torch.nn.Linear(dim_embedding, 2 * dim_embedding),
             torch.nn.GroupNorm(num_groups=16, num_channels=2 * dim_embedding),
@@ -114,7 +121,6 @@ class FNet(torch.nn.Module):
         theta_emb = self.input_layer(theta)
         x_emb = self.cond_layer(x)
         t_emb = self.time_embedding(t)
-
         emb = self.embedding_map(t_emb + x_emb)
         for lr in self.res_layers:
             theta_emb = lr(x=theta_emb, emb=emb)
@@ -158,3 +164,84 @@ class FakeFNet(torch.nn.Module):
         real_eps = self.real_eps_fun(theta, x, t)
         perturb = self.eps_net(theta, x, t)
         return real_eps + self.eps_net_max * perturb
+
+
+class GaussianNet(torch.nn.Module):
+    def __init__(self, hidden_dim, output_dim):
+        super().__init__()
+        self.output_dim=output_dim
+        self.mu_prior = torch.ones(2)
+        self.inv_cov_prior=torch.eye(2)*1.0/3
+        self.inv_cov_lik=torch.eye(2)*1.0/2
+        self.cov_post=torch.linalg.inv(self.inv_cov_prior+self.inv_cov_lik)
+        
+        self.A_t = torch.nn.Sequential(
+            torch.nn.Linear(1, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, output_dim*output_dim, bias=True),
+            
+        )
+        self.B_t = torch.nn.Sequential(
+            torch.nn.Linear(1, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, output_dim*output_dim, bias=True),
+        )
+        self.C_t = torch.nn.Sequential(
+            torch.nn.Linear(1, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, output_dim, bias=True),        
+        )
+
+    def alpha_t(self,t):
+        log_alpha = 0.5 * 19.9 * (t**2) + 0.1 * t
+        return torch.exp(-log_alpha)
+    
+    def forward(self, theta, x, t):
+        t_tmp=t
+        cut=False # to adapt the size of the return score to the input variables
+        if t.ndim==0:
+            t_tmp=torch.tensor([t])
+        t_tmp=t_tmp.unsqueeze(1)
+        # print("theta bef net", theta.size())
+        # print("x bef net", x.size())
+        # print("t bef net", t.size())
+
+        if theta.shape[0]!=x.shape[0]:
+            theta, x = broadcast(theta, x, ignore=1)
+        
+        if theta.ndim==1:
+            theta=theta.unsqueeze(0)
+            x=x.unsqueeze(0)
+            cut=True
+
+        alpha=self.alpha_t(t_tmp)
+        A=(self.A_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
+        #size (batch_size,2,2)
+        #A=(1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t_tmp.shape[0],1,1))+alpha[...,None]*(self.cov_post.repeat(t_tmp.shape[0],1,1)))
+        B=(self.B_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
+        #size (batch_size,2,2)
+        #B = self.alpha_t(t_tmp)[...,None]**0.5 * (self.cov_post@self.inv_cov_lik).repeat(t_tmp.shape[0],1,1)
+        C = self.C_t(t_tmp)
+        #size (batch_size,2)
+        #C = self.alpha_t(t_tmp)**0.5*(self.cov_post@self.inv_cov_prior@self.mu_prior).repeat(t_tmp.shape[0],1)
+        # score = (A@theta[...,None])[:,:,0] + (B@x[...,None])[:,:,0] + C
+        score = A@((theta[...,None])[:,:,0] + (B@x[...,None])[:,:,0] + C)[...,None]
+        # size(batch size,2)
+        
+        # print("in net score",score.size())
+        # print("t in net", t.ndim)
+        if cut:
+            return score[0,:,0]
+        else:
+            return score[:,:,0]
+        

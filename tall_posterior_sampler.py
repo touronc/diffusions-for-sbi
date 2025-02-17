@@ -7,9 +7,9 @@ from tqdm import tqdm
 from vp_diffused_priors import get_vpdiff_gaussian_score
 
 
-def mean_backward(theta, t, score_fn, nse, **kwargs):
+def mean_backward(theta, t, score_fn, nse, **kwargs): #compute the mean of the backward kernel
     alpha_t = nse.alpha(t)
-    sigma_t = nse.sigma(t)
+    sigma_t = nse.sigma(t) #1-alpha_t
 
     return (
         1
@@ -19,6 +19,8 @@ def mean_backward(theta, t, score_fn, nse, **kwargs):
 
 
 def sigma_backward(t, dist_cov, nse):
+    #return the cov of the backward kernel
+    #dist_cov is the inverse approximate posterior cov at t=0
     alpha_t = nse.alpha(t)
     sigma_t = nse.sigma(t)
     eye = torch.eye(dist_cov.shape[-1]).to(alpha_t.device)
@@ -26,24 +28,29 @@ def sigma_backward(t, dist_cov, nse):
     if (alpha_t**0.5) < 0.5:
         return torch.linalg.inv(
             torch.linalg.inv(dist_cov) + (alpha_t / sigma_t**2) * eye
-        )
+        ) #if q_data is a gaussian distribution
     return ((sigma_t**2) / alpha_t) * eye - (
         ((sigma_t**2) ** 2 / alpha_t)
     ) * torch.linalg.inv(alpha_t * (dist_cov.to(alpha_t.device) - eye) + eye)
 
 
 def prec_matrix_backward(t, dist_cov, nse):
+    #dist_cov is the inverse cov of the t=0 individual posterior
+    #return the inv of diffused posterior cov at time t if qdata is gaussian (GAUSS)
     alpha_t = nse.alpha(t)
-    sigma_t = nse.sigma(t)
+    sigma_t = nse.sigma(t) #corresponds to 1-alpha_t
     eye = torch.eye(dist_cov.shape[-1]).to(alpha_t.device)
     # Same as the other but using woodberry. (eq 53 or https://arxiv.org/pdf/2310.06721.pdf)
     # return torch.linalg.inv(dist_cov * alpha_t + (sigma_t**2) * eye)
+    # if t>0.1680 and t<0.1730:
+    #     print("prec backward",alpha_t/sigma_t**2)
     return (
         torch.linalg.inv(dist_cov.to(alpha_t.device)) + (alpha_t / sigma_t**2) * eye
     )
 
 
 def tweedies_approximation(
+        #return the backward mean, backward cov for GAUSS and JAC and the score
     x,
     theta,
     t,
@@ -55,7 +62,7 @@ def tweedies_approximation(
     partial_factorization=False,
 ):
     alpha_t = nse.alpha(t)
-    sigma_t = nse.sigma(t)
+    sigma_t = nse.sigma(t) #correspond to v_t**0,5 or (1-alpha_t)**0,5
 
     if mode == "JAC":
         if nse.net_type == "fnet":
@@ -70,7 +77,19 @@ def tweedies_approximation(
                 lambda theta: vmap(jacrev(score_jac, has_aux=True))(
                     theta[None].repeat(x.shape[0], 1), x
                 )
-            )(theta)
+            )(theta) #compute the jacobian of the score
+        
+        # if nse.net_type == "gaussian":
+        #     print(theta.size())
+        #     print(x.size())
+        #     def score_jac(theta, x):
+        #         score = vmap(lambda x : score_fn(theta=theta, t=t,x=x),in_dims=0)(x)
+        #         return score, score
+        #     print("jac score",score_jac(theta,x)[0].size())
+        #     print(len(jacrev(score_jac,argnums=0)(theta,x)))
+        #     jac_score = vmap(lambda theta: jacrev(score_jac,argnums=0)(theta,x),
+        #                      randomness="different")(x)
+        #     print("output",jac_score.size())
         else:
 
             def score_jac(theta, x):
@@ -83,34 +102,55 @@ def tweedies_approximation(
                         jacrev(score_jac, has_aux=True), in_dims=(None, 0)
                     )(theta, x)
                 )(theta)
+                #print("jac score",jac_score.size())
             else:
                 jac_score, score = vmap(
                     jacrev(score_jac, has_aux=True), in_dims=(None, 0)
                 )(theta, x)
+        
+        if sigma_t**2==1:
+            sigma_t-=1e-6
 
         cov = (sigma_t**2 / alpha_t) * (
             torch.eye(theta.shape[-1], device=theta.device) + (sigma_t**2) * jac_score
         )
-        prec = torch.linalg.inv(cov)
+        #compute the backward cov Sigma_t,j^-1 for the indiv posterior p(theta|xj) JAC algo
+        prec = torch.linalg.inv(cov) 
     elif mode == "GAUSS":
-        if nse.net_type == "fnet":
 
+        if nse.net_type == "fnet":
+            
             def score_jac(theta, x):
+                
                 n_theta = theta.shape[0]
                 n_x = x.shape[0]
                 score = score_fn(
                     theta=theta[:, None, :]
                     .repeat(1, n_x, 1)
                     .reshape(n_theta * n_x, -1),
-                    t=t[None, None].repeat(n_theta * n_x, 1),
+                    t=t[None, None].repeat(n_theta * n_x, 1).squeeze(),
                     x=x[None, ...].repeat(n_theta, 1, 1).reshape(n_theta * n_x, -1),
                 )
                 score = score.reshape(n_theta, n_x, -1)
                 return score, score
-
+            
             score = score_jac(theta, x)[0]
+        # if nse.net_type == "gaussian":
+        #     # print("theta in tweedie",theta.size())
+        #     # print("x in tweedie",x.size())
+        #     score = score_fn(theta,x,t)
+            # score = vmap(
+            #         lambda theta: vmap(
+            #             partial(score_fn, t=t),
+            #             in_dims=(None, 0),
+            #             randomness="different",
+            #         )(theta, x),
+            #         randomness="different",
+            #     )(theta)
+            #score=score.squeeze(2)
+            #print("score gauss", score.size())
         else:
-            if not partial_factorization:
+            if not partial_factorization:  
                 score = vmap(
                     lambda theta: vmap(
                         partial(score_fn, t=t),
@@ -119,16 +159,18 @@ def tweedies_approximation(
                     )(theta, x),
                     randomness="different",
                 )(theta)
+
             else:
                 score = score_fn(theta[:, None], x[None, :], t)
-
+        #compute Sigma_t,j^-1 when initial data is gaussian and cov matrix is estimated
         prec = prec_matrix_backward(t=t, dist_cov=dist_cov_est, nse=nse)
         # # Same as the other but using woodberry. (eq 53 or https://arxiv.org/pdf/2310.06721.pdf)
         # cov = torch.linalg.inv(torch.linalg.inv(dist_cov_est) + (alpha_t / sigma_t ** 2) * eye)
-        prec = prec[None].repeat(theta.shape[0], 1, 1, 1)
+        prec = prec[None].repeat(theta.shape[0], 1, 1, 1) #return the Sigmat,j^-1 (GAUSS)
 
     else:
         raise NotImplemented("Available methods are GAUSS, PSEUDO, JAC")
+    # tweedie approx for the mean of the backward kernels
     mean = 1 / (alpha_t**0.5) * (theta[:, None] + sigma_t**2 * score)
     if clip_mean_bounds[0]:
         mean = mean.clip(*clip_mean_bounds)
@@ -136,6 +178,8 @@ def tweedies_approximation(
 
 
 def tweedies_approximation_prior(theta, t, score_fn, nse, mode="vmap"):
+    #use jac approximation here, don't suppose the prior is gaussian
+    #return Sigma_lambda,t^-1, mean of backward kernel for the prior and the score s_lambda
     alpha_t = nse.alpha(t)
     sigma_t = nse.sigma(t)
     if mode == "vmap":
@@ -144,7 +188,7 @@ def tweedies_approximation_prior(theta, t, score_fn, nse, mode="vmap"):
             score = score_fn(theta=theta, t=t)
             return score, score
 
-        jac_score, score = vmap(jacrev(score_jac, has_aux=True))(theta)
+        jac_score, score = vmap(jacrev(score_jac, has_aux=True))(theta) #compute the jacobian of the score
     else:
         raise NotImplemented
     mean = 1 / (alpha_t**0.5) * (theta + sigma_t**2 * score)
@@ -170,48 +214,62 @@ def diffused_tall_posterior_score(
     n_obs = x_obs.shape[0]
 
     # Tweedies approx for p_{0|t}
-    prec_0_t, _, scores = tweedies_approximation(
+    prec_0_t, _, scores = tweedies_approximation( #get the scores sj and Sigma,t,j for all j
         x=x_obs,
         theta=theta,
         nse=nse,
         t=t,
         score_fn=nse.score if score_fn is None else score_fn,
-        dist_cov_est=dist_cov_est,
+        dist_cov_est=dist_cov_est, #this estimate is for GAUSS algo only, corresp to the cov of t=0 indiv posterior
         mode=cov_mode,
     )
+    # if t>0.1680 and t<0.1730:
+    #     print("prec 0 t",prec_0_t)
     prior_score = prior_score_fn(theta, t)
 
     if prior_type == "gaussian":
-        prec_prior_0_t = prec_matrix_backward(t, prior.covariance_matrix, nse).repeat(
+    
+        prec_prior_0_t = prec_matrix_backward(t, prior.covariance_matrix, nse).repeat(#use the formula for a gaussian initial distribution
             theta.shape[0], 1, 1
-        )
-        prec_score_prior = (prec_prior_0_t @ prior_score[..., None])[..., 0]
-        prec_score_post = (prec_0_t @ scores[..., None])[..., 0]
-        lda = prec_prior_0_t * (1 - n_obs) + prec_0_t.sum(dim=1)
+        ) #return diff inv cov at time t (Sigma_t,lambda^-1) if initial data is gaussian
+        # if t>0.15 and t<0.19:
+        #     print(prec_prior_0_t)
+        prec_score_prior = (prec_prior_0_t @ prior_score[..., None])[..., 0] #Sigma_lambda,t^-1 @ s_lambda
+        
+        prec_score_post = (prec_0_t @ scores[..., None])[..., 0] # Sigma_t,j^-1 @ s_j for all j
+        # if t>0.1680 and t<0.1730:
+            #print("prec score post",prec_score_post)
+        lda = prec_prior_0_t * (1 - n_obs) + prec_0_t.sum(dim=1) #big lambda
         weighted_scores = prec_score_prior + (
-            prec_score_post - prec_score_prior[:, None]
+            prec_score_post - prec_score_prior[:, None] #corresp to tilde s (algo GAUSS)
         ).sum(dim=1)
-
         total_score = torch.linalg.solve(A=lda, B=weighted_scores)
+        # if t>0.1680 and t<0.1730 and cov_mode=="GAUSS":
+        #     #print("prec score post", prec_score_post)
+        #     print("weig",weighted_scores.size())
+        #     print("lda",lda)
+        #     print("total score",total_score)
     else:
-        total_score = (1 - n_obs) * prior_score + scores.sum(dim=1)
+        total_score = (1 - n_obs) * prior_score + scores.sum(dim=1) #why ?
         if (nse.alpha(t) ** 0.5 > 0.5) and (n_obs > 1):
-            prec_prior_0_t, _, _ = tweedies_approximation_prior(
+            prec_prior_0_t, _, _ = tweedies_approximation_prior( #get Sigma_lambda,t^-1 (JAC algo)
                 theta, t, prior_score_fn, nse
             )
-            prec_score_prior = (prec_prior_0_t @ prior_score[..., None])[..., 0]
-            prec_score_post = (prec_0_t @ scores[..., None])[..., 0]
-            lda = prec_prior_0_t * (1 - n_obs) + prec_0_t.sum(dim=1)
+            prec_score_prior = (prec_prior_0_t @ prior_score[..., None])[..., 0]#Sigma_lambda,t^-1 @ s_lambda
+            prec_score_post = (prec_0_t @ scores[..., None])[..., 0]#  Sigma_t,j^-1 @ s_j for all j
+            lda = prec_prior_0_t * (1 - n_obs) + prec_0_t.sum(dim=1) #big lambda
             weighted_scores = prec_score_prior + (
                 prec_score_post - prec_score_prior[:, None]
-            ).sum(dim=1)
-
+            ).sum(dim=1) #corresp to tilde_s
+            
             total_score = torch.linalg.solve(A=lda, B=weighted_scores)
+    # if t>0.1680 and t<0.1730 and cov_mode=="GAUSS":
+    #         print("total score before end fct",total_score)
     return total_score  # / (1 + (1/n_obs)*torch.abs(total_score))
 
 
 def euler_sde_sampler(
-    score_fn,
+    score_fn, #compute the score of the tall diffused posterior at times t
     nsamples,
     dim_theta,
     beta,
@@ -219,8 +277,11 @@ def euler_sde_sampler(
     debug=False,
     theta_clipping_range=(None, None),
 ):
+    "sample from the true tall posterior with reverse SDE and euler step"
+    #start with a gaussian sample from p_T(theta|x)
+    eps_s=1e-3
     theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
-    time_pts = torch.linspace(1, 0, 1000).to(device)  # (ntime_pts,)
+    time_pts = eps_s + (1-eps_s)*torch.linspace(1, 0, 1000).to(device)  # (ntime_pts,)
     theta_list = [theta_t]
     gradlogL_list = []
     lda_list = []
@@ -230,7 +291,6 @@ def euler_sde_sampler(
     for i in tqdm(range(len(time_pts) - 1)):
         t = time_pts[i]
         dt = time_pts[i + 1] - t
-
         # calculate the drift and diffusion terms
         f = -0.5 * beta(t) * theta_t
         g = beta(t) ** 0.5
@@ -246,11 +306,11 @@ def euler_sde_sampler(
         else:
             score = score_fn(theta_t, t)
         score = score.detach()
-
-        drift = f - g * g * score
+        drift = f - g * g * score #reverse SDE eq (6) p.4
         diffusion = g
 
         # euler-maruyama step
+        # theta_t = theta_t-1 + dt*drift + diffusion*Z with Z from N(0,dtI)
         theta_t = (
             theta_t.detach()
             + drift * dt
@@ -279,6 +339,54 @@ def euler_sde_sampler(
         )
     else:
         return theta_t, theta_list
+    
+def heun_ode_sampler(
+    score_fn, #compute the score of the tall diffused posterior at times t
+    nsamples,
+    dim_theta,
+    beta,
+    device="cpu",
+    theta_clipping_range=(None, None),
+):
+    "sample from the true tall posterior with reverse SDE and euler step"
+    #start with a gaussian sample from p_T(theta|x)
+    theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
+    time_pts = torch.linspace(1, 0, 1000).to(device)  # (ntime_pts,)
+    theta_list = [theta_t]
+    
+    for i in tqdm(range(len(time_pts) - 1)):
+        # compute current time step t_i
+        t = time_pts[i]
+        dt = time_pts[i + 1] - t
+
+        # calculate the drift and diffusion terms at t_i
+        f = -0.5 * beta(t) * theta_t
+        g = beta(t) ** 0.5
+        # estimated score at t_i
+        score = score_fn(theta_t, t)
+        score = score.detach()
+        # evaluate dx/dt at t_i
+        d_i = f - 0.5 * g * g * score 
+        # euler step from t_i to t_i+1
+        tmp_theta_tp1 = theta_t.detach() + dt * d_i 
+        if i < len(time_pts) - 2:
+            # corretion step
+            # take next time step t_i+1
+            t = time_pts[i+1]
+            #compute drift and diffusion at t_i+1 and tmp_x_i+1
+            f = -0.5 * beta(t) * tmp_theta_tp1
+            g = beta(t) ** 0.5
+            score = score_fn(tmp_theta_tp1, t).detach()
+            # evaluate dx/dt at t_i+1
+            d_i_prime = f - 0.5 * g * g * score
+            theta_t = theta_t.detach() + dt*(d_i/2 + d_i_prime/2)
+        if theta_clipping_range[0] is not None:
+            theta_t = theta_t.clip(*theta_clipping_range)
+        theta_list.append(theta_t.detach().cpu())
+        
+    theta_list[0] = theta_list[0].detach().cpu()
+    
+    return theta_t, theta_list
 
 
 if __name__ == "__main__":
@@ -300,15 +408,15 @@ if __name__ == "__main__":
     simulator = task.simulator
 
     # Observations
-    theta_true = torch.FloatTensor([-5, 150])  # true parameters
-    x_obs_100 = torch.cat(
+    theta_true = torch.FloatTensor([-5, 150])  # true parameters, size (dim theta)
+    x_obs_100 = torch.cat( #100 extra obs, size(nextra, dim x)
         [simulator(theta_true).reshape(1, -1) for _ in range(100)], dim=0
     )
 
     # Train data
-    theta_train = task.prior.sample((N_TRAIN,))
-    x_train = simulator(theta_train)
-
+    theta_train = task.prior.sample((N_TRAIN,)) #size(NTRAIN, dim theta)
+    x_train = simulator(theta_train)# size(NTRAIN, dim x)
+    
     # normalize theta
     theta_train_ = (theta_train - theta_train.mean(axis=0)) / theta_train.std(axis=0)
 
@@ -317,26 +425,27 @@ if __name__ == "__main__":
     x_obs_100_ = (x_obs_100 - x_train.mean(axis=0)) / x_train.std(axis=0)
 
     # # train score network
-    # dataset = torch.utils.data.TensorDataset(theta_train_.cuda(), x_train_.cuda())
-    # score_net = NSE(theta_dim=2, x_dim=2, hidden_features=[128, 256, 128]).cuda()
-
-    # avg_score_net = train(
-    #     model=score_net,
-    #     dataset=dataset,
-    #     loss_fn=NSELoss(score_net),
-    #     n_epochs=200,
-    #     lr=1e-3,
-    #     batch_size=256,
-    #     prior_score=False, # learn the prior score via the classifier-free guidance approach
-    # )
-    # score_net = avg_score_net.module
-    # torch.save(score_net, "score_net.pkl")
+    dataset = torch.utils.data.TensorDataset(theta_train_.cuda(), x_train_.cuda())
+    score_net = NSE(theta_dim=2, x_dim=2, hidden_features=[128, 256, 128]).cuda() #no embedding net, simple MLP with 3 layers
+    avg_score_net = train(
+        model=score_net,
+        dataset=dataset,
+        loss_fn=NSELoss(score_net),
+        n_epochs=200,
+        lr=1e-3,
+        batch_size=256,
+        #prior_score=False, # learn the prior score via the classifier-free guidance approach
+    )
+    score_net = avg_score_net.module #copy the trained module of the averaged model
+    #torch.save(score_net, "score_net.pkl")
 
     # load score network
-    score_net = torch.load("score_net.pkl").cuda()
+    # score_net = torch.load("score_net.pkl").cuda()
 
     # normalize prior
+    #loc is almost 0
     loc_ = (prior.prior.loc - theta_train.mean(axis=0)) / theta_train.std(axis=0)
+    #cov is almost identity
     cov_ = (
         torch.diag(1 / theta_train.std(axis=0))
         @ prior.prior.covariance_matrix
@@ -350,7 +459,7 @@ if __name__ == "__main__":
     )
 
     for N_OBS in [2, 30, 40, 50, 60, 70, 80, 90]:
-        t = torch.linspace(0, 1, 1000)
+        t = torch.linspace(0, 1, 1000) #time discretization
 
         true_posterior = task.true_tall_posterior(x_obs_100[:N_OBS])
 

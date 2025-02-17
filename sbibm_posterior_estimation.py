@@ -17,7 +17,7 @@ PATH_EXPERIMENT = "results/sbibm/"
 NUM_OBSERVATION_LIST = list(np.arange(1, 26))
 
 N_TRAIN_LIST = [1000, 3000, 10000, 30000]  # , 50000]
-MAX_N_TRAIN = 50_000
+MAX_N_TRAIN = 50#_000
 N_OBS_LIST = [1, 8, 14, 22, 30]
 MAX_N_OBS = 100
 NUM_SAMPLES = 1000
@@ -67,10 +67,11 @@ def run_train_sgm(
     clf_free_guidance=False,
     save_path=PATH_EXPERIMENT,
 ):
+    "train a score network to approximate each individual posterior score"
     # Set Device
     device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda:1"
+    # if torch.cuda.is_available():
+    #     device = "cuda:1"
 
     # Prepare training data
     # normalize theta
@@ -92,7 +93,7 @@ def run_train_sgm(
         x_dim=x_dim,
         hidden_features=[256, 256, 256],
     ).to(device)
-
+    print(score_network)
     # Train score network
     print(
         "=============================================================================="
@@ -150,7 +151,7 @@ def run_sample_sgm(
     context,
     nsamples,
     steps,  # number of ddim steps
-    score_network,
+    score_network, #already trained for each indiviual posterior at all times t
     theta_train_mean,
     theta_train_std,
     x_train_mean,
@@ -168,8 +169,8 @@ def run_sample_sgm(
 ):
     # Set Device
     device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda:1"
+    # if torch.cuda.is_available():
+    #     device = "cuda:1"
 
     n_obs = context.shape[0]
 
@@ -179,7 +180,7 @@ def run_sample_sgm(
     context_norm = (context - x_train_mean) / x_train_std
     # replace nan by 0 (due to std in sir for n_train = 1000)
     context_norm = torch.nan_to_num(context_norm, nan=0.0, posinf=0.0, neginf=0.0)
-
+    print("context",context_norm.size())
     # normalize prior
     if prior_type == "uniform":
         low_norm = (prior.low - theta_train_mean) / theta_train_std * 2
@@ -274,7 +275,7 @@ def run_sample_sgm(
 
         cov_est, cov_est_prior = None, None
         if cov_mode == "GAUSS":
-            # estimate cov for GAUSS
+            # estimate cov for GAUSS (backward cov^-1 for each indiv posterior p(theta|_xj))
             cov_est = vmap(
                 lambda x: score_network.ddim(
                     shape=(nsamples,), x=x, steps=100, eta=0.5
@@ -282,7 +283,6 @@ def run_sample_sgm(
                 randomness="different",
             )(context_norm.to(device))
             cov_est = vmap(lambda x: torch.cov(x.mT))(cov_est)
-
             if clf_free_guidance:
                 x_ = torch.zeros_like(context_norm[0][None, :])  #
                 cov_est_prior = vmap(
@@ -294,6 +294,7 @@ def run_sample_sgm(
                 cov_est_prior = vmap(lambda x: torch.cov(x.mT))(cov_est_prior)
 
         if sampler_type == "ddim":
+            #sample with DDIM and cov mode is JAC or GAUSS
             save_path += f"ddim_steps_{steps}/"
 
             samples = score_network.ddim(
@@ -310,7 +311,7 @@ def run_sample_sgm(
                 prior_type=prior_type,
                 prior_score_fn=prior_score_fn_norm,
                 clf_free_guidance=clf_free_guidance,
-                dist_cov_est=cov_est,
+                dist_cov_est=cov_est, #if GAUSS, use estimated cov at time 0 to compute Sigma_t,j^-1
                 dist_cov_est_prior=cov_est_prior,
                 cov_mode=cov_mode,
                 verbose=True,
@@ -334,7 +335,7 @@ def run_sample_sgm(
             (
                 samples,
                 _,
-            ) = euler_sde_sampler(
+            ) = euler_sde_sampler( #sample with reverse SDE and the score at all times t
                 score_fn,
                 nsamples,
                 dim_theta=theta_train_mean.shape[-1],
@@ -515,6 +516,7 @@ if __name__ == "__main__":
             dataset_train = task.get_training_data(n_simulations=MAX_N_TRAIN)
             theta_train = dataset_train["theta"].float()
             x_train = dataset_train["x"].float()
+
             # extract training data for given n_train
             theta_train, x_train = theta_train[:n_train], x_train[:n_train]
             print("Training data:", theta_train.shape, x_train.shape)
@@ -531,6 +533,7 @@ if __name__ == "__main__":
                 dim=0
             ), theta_train.std(dim=0)
             x_train_mean, x_train_std = x_train.mean(dim=0), x_train.std(dim=0)
+        
             means_stds_dict = {
                 "theta_train_mean": theta_train_mean,
                 "theta_train_std": theta_train_std,

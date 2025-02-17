@@ -11,8 +11,10 @@ from zuko.distributions import DiagNormal, NormalizingFlow
 from zuko.nn import MLP
 from zuko.transforms import FreeFormJacobianTransform
 from zuko.utils import broadcast
+from torch.func import vmap
 
-from embedding_nets import FNet
+
+from embedding_nets import FNet, GaussianNet
 from tall_posterior_sampler import (
     prec_matrix_backward,
     tweedies_approximation,
@@ -88,16 +90,23 @@ class NSE(nn.Module):
             self.net = build_net(
                 self.theta_emb_dim + self.x_emb_dim + 2 * freqs, theta_dim, **kwargs
             )
+            
         elif net_type == "fnet":
             self.net = FNet(
                 dim_input=theta_dim, dim_cond=x_dim, dim_embedding=128, n_layers=1
+            )
+
+        elif net_type == "gaussian" or net_type == "analytical":
+            self.net = GaussianNet(
+                hidden_dim=16, output_dim=theta_dim
             )
         else:
             raise NotImplementedError("Unknown net_type")
 
         self.tweedies_approximator = tweedies_approximation
-
-        self.register_buffer("freqs", torch.arange(1, freqs + 1) * math.pi)
+        self.register_buffer("freqs", torch.arange(1, freqs + 1) * math.pi) #return [1,2,3]*pi
+        #self.freqs=freqs
+        
         self.register_buffer("zeros", torch.zeros(theta_dim))
         self.register_buffer("ones", torch.ones(theta_dim))
 
@@ -121,32 +130,56 @@ class NSE(nn.Module):
         """
 
         if self.net_type == "default":
-            # compute positional encoding for `t`
-            t = self.freqs * t[..., None]
-            t = torch.cat((t.cos(), t.sin()), dim=-1)
-
+            if 0:
+                # compute sinusoidal positional encoding for `t`
+                # sin(t * exp(-log(10000)/dim * i)) where i=[0,1...,dim]
+                # cos(t * exp(-log(10000)/dim * i)) where i=[0,1...,dim]
+                # magic number 10000 is from transformers
+                max_positions=10000
+                half_dim = self.freqs #nb of freqs to compute the sin and cos
+                emb = math.log(max_positions) / (half_dim - 1)
+                emb = torch.exp(-torch.arange(half_dim) * emb)
+                #print("forward t ", t[..., None].size())
+                #print(t.ndim)
+                #print("freqs", emb[None, :].size())
+                # if t.ndim==0:
+                #     t = t.unsqueeze(0)
+                #emb = t[:, None] * emb[None, :]
+                emb = emb * t[..., None]
+                t = torch.cat((emb.cos(), emb.sin()), dim=-1)
+                #print("t", t.size())
+            else:
+                #print("freqs",self.freqs.size())
+                t = self.freqs * t[..., None]
+                t = torch.cat((t.cos(), t.sin()), dim=-1)
+           
             # compute embeddings for `theta` and `x`
             theta = self.embedding_nn_theta(theta)
             x = self.embedding_nn_x(x)
 
             # broadcast `theta`, `x`, and `t` to the same shape
             theta, x, t = broadcast(theta, x, t, ignore=1)
-
+            #print("size t",t.size())
             # concatenate variables and output the estimated noise
             return self.net(torch.cat((theta, x, t), dim=-1))
 
-        if self.net_type == "fnet":
+        elif self.net_type == "fnet":
             return self.net(theta, x, t)
-
+        
+        elif self.net_type == "gaussian" or self.net_type == "analytical":
+            return self.net(theta,x,t)
+        
     # The following function define the VP SDE with linear noise schedule beta(t):
     # dtheta = f(t) theta dt + g(t) dW = -0.5 * beta(t) theta dt + sqrt(beta(t)) dW
 
     def score(self, theta: Tensor, x: Tensor, t: Tensor, **kwargs) -> Tensor:
+        #the score is related to the noise estimator
         return -self(theta, x, t) / self.sigma(t)
+    
 
     def beta(self, t: Tensor) -> Tensor:
         r"""Linear noise schedule of the VP SDE: `beta(t) = 32*t`."""
-        return 32 * t
+        return 32 * t #beta_min=0 et beta_max=32
 
     def f(self, t: Tensor) -> Tensor:
         """Drift of the VP SDE: `f(t) = -0.5 * beta(t)`."""
@@ -156,11 +189,11 @@ class NSE(nn.Module):
         """`g(t) = sqrt(beta(t))`."""
         return torch.sqrt(self.beta(t))
 
-    def alpha(self, t: Tensor) -> Tensor:
-        r"""Mean of the transition kernel of the VP SDE:
+    def alpha(self, t: Tensor) -> Tensor: #see SDE paper eq 29 p15 (should be multiplied by theta_0)
+        r"""! Square root ! of Mean of the transition kernel of the VP SDE:
         `alpha(t) = \exp ( -0.5 \int_0^t beta(s)ds)`.
         """
-        return torch.exp(-16 * t**2)
+        return torch.exp(-16 * t**2) #should be -8*t**2
 
     def sigma(self, t: Tensor) -> Tensor:
         r"""Standard deviation of the transition kernel of the VP SDE:
@@ -197,16 +230,20 @@ class NSE(nn.Module):
         )
 
     def mean_pred(
+        # corresponds to the denoised image f_theta
         self, theta: Tensor, score: Tensor, alpha_t: Tensor, **kwargs
     ) -> Tensor:
         """Mean predictor of the backward kernel
         (used in DDIM sampler and gaussian approximation).
         """
+
         upsilon = 1 - alpha_t
         mean = (alpha_t ** (-0.5)) * (theta + upsilon * score)
         return mean
 
-    def bridge_mean(
+    def bridge_mean( 
+        #compute the mean of the reverse process
+        #est_noise corresponds to epsilon_theta
         self,
         alpha_t: Tensor,
         alpha_t_1: Tensor,
@@ -252,15 +289,17 @@ class NSE(nn.Module):
         """
         if x.shape[0] == shape[0] or len(x.shape) == 1 or x.shape[0] == 1:
             score_fun = partial(self.score, **kwargs)
-        else:
+        else: #call the factorized score function if nb of obs >1
             score_fun = partial(self.factorized_score, **kwargs)
-
-        time = torch.linspace(1, 0, steps + 1).to(x)
+        eps_s=1e-3
+        time = eps_s+(1-eps_s)*torch.linspace(1, 0, steps + 1).to(x)
         dt = 1 / steps
-
+        
+        #on part de q_T=N(0,I) puis on fait le reverse process jusqu'à t=0
         theta = DiagNormal(self.zeros, self.ones).sample(shape)
 
         for t in tqdm(time[:-1], disable=not verbose):
+            #theta will follow p_t at each iteration
             theta = self.ddim_step(theta, x, t, score_fun, dt, eta)
             if theta_clipping_range[0] is not None:
                 theta = theta.clip(*theta_clipping_range)
@@ -277,23 +316,28 @@ class NSE(nn.Module):
         **kwargs,
     ):
         r"""One step of the DDIM sampler."""
-
-        score = score_fun(theta, x, t).detach()
-
+        # size (num_samples, dim theta)
+        
+        score = score_fun(theta, x, t).detach() #compute the score of tall posterior
         alpha_t = self.alpha(t)
         alpha_t_1 = self.alpha(t - dt)
         bridge_std = eta * (
             (((1 - alpha_t_1) / (1 - alpha_t)) * (1 - alpha_t / alpha_t_1)) ** 0.5
-        )
+        ) #corresponds to sigma_t, std of the reverse transition kernels
+        # if eta=1 DDPM reverse process, if eta=0 DDIM reverse process
 
+        #predicts the denoised theta from theta_t ie f(theta_t)=hat(theta_0)
+        # size (num_samples, dim theta)
         pred_theta_0 = self.mean_pred(theta=theta, score=score, alpha_t=alpha_t)
-        theta_mean = self.bridge_mean(
+
+        theta_mean = self.bridge_mean( #compute the mean of the reverse transition kernel q_sigma(t-1|t)
             alpha_t=alpha_t,
             alpha_t_1=alpha_t_1,
             theta_0=pred_theta_0,
             theta_t=theta,
             bridge_std=bridge_std,
-        )
+        )# size (num_samples, dim theta)
+        #theta ~ N(theta_mean,bridge_std**2I)=q_sigma(t-1|t)
 
         theta = theta_mean + torch.randn_like(theta_mean) * bridge_std
         return theta
@@ -332,7 +376,7 @@ class NSE(nn.Module):
             g = score_fun(theta, x, t).detach()
             # Step size as defined in [Song et al, 2021]
             # (Alg 5 in https://arxiv.org/pdf/2011.13456.pdf with sigma^2 replacing 1/ ||g||^2)
-            eps = r * (self.alpha(t) ** 0.5) * (self.sigma(t) ** 2)
+            eps = r * (self.alpha(t) ** 0.5) * (self.sigma(t) ** 2) # pq manque-t-il 2?
             tamed_eps = (eps / (1 + eps * torch.linalg.norm(g, axis=-1)))[..., None]
             theta = theta + tamed_eps * g + ((2 * eps) ** 0.5) * z
         return theta
@@ -375,7 +419,6 @@ class NSE(nn.Module):
         """
 
         # get simple or tall data score function
-
         if x.shape[0] == shape[0] or len(x.shape) == 1 or x.shape[0] == 1:
             score_fun = partial(self.score, **kwargs)
         else:
@@ -401,16 +444,17 @@ class NSE(nn.Module):
         # run the PC sampler
         time = torch.linspace(1, 0, steps + 1).to(x)
         dt = 1 / steps
-
+        # start from theta_T ~ N(0,I)
         theta = DiagNormal(self.zeros, self.ones).sample(shape)
 
         for t in tqdm(time[:-1], disable=not verbose):
             # predictor step
-            theta_pred = predictor_fun(
+            theta_pred = predictor_fun( #on fait un DDIM step to get an approx sample from p_(t-dt)
                 theta=theta, x=x, t=t, score_fun=score_fun, dt=dt
             )
             # corrector step
             theta = corrector_fun(theta=theta_pred, x=x, t=t - dt, score_fun=score_fun)
+            #on corrige le sample to be sure it is a true sample from p_(t-dt)
             if theta_clipping_range[0] is not None:
                 theta = theta.clip(*theta_clipping_range)
         return theta
@@ -447,29 +491,30 @@ class NSE(nn.Module):
             verbose: If True, displays a progress bar, default is False.
             kwargs: Additional args for the score function.
         """
-        time = torch.linspace(1, 0, steps + 1).to(x)
-
+        eps_s=1e-3
+        time = eps_s+(1-eps_s)*torch.linspace(1, 0, steps + 1).to(x)
+        # start from a normal standard variable
+        # t runs reversely (from 1 to 0)
         theta = DiagNormal(self.zeros, self.ones).sample(shape)
-
         for i, t in enumerate(tqdm(time[:-1], disable=not verbose)):
+            #i is the indice of the steps and t is the corresponding t_i
+            
             if i < steps - 1:
-                gamma_t = self.alpha(t) / self.alpha(t - time[-2])
-            else:
+                gamma_t = self.alpha(t) / self.alpha(t - time[-2]) #correspond to t-dt
+            else: #for t_0
                 gamma_t = self.alpha(t)
-
+            #tau should be 0.3 in the paper but 0.5 in julia's paper
             delta = tau * (1 - gamma_t) / (gamma_t**0.5)
-            for _ in range(lsteps):
-                z = torch.randn_like(theta)
-
+            for _ in range(lsteps):#at the end of the loop we get a sample from p_t
+                z = torch.randn_like(theta) #sample from normal standard
+                
                 if len(x.shape) == 1 or x.shape[0] == 1:
                     score = self.score(theta, x, t, **kwargs).detach()
                 else:
-                    score = self.factorized_score_geffner(
+                    score = self.factorized_score_geffner(#if we have several cond obs)
                         theta, x, t, prior_score_fn, prior_type=prior_type, **kwargs
-                    ).detach()
-
+                    ).detach().squeeze(0)
                 theta = theta + delta * score + ((2 * delta) ** 0.5) * z
-
             if theta_clipping_range[0] is not None:
                 theta = theta.clip(*theta_clipping_range)
 
@@ -482,7 +527,7 @@ class NSE(nn.Module):
         self,
         theta: Tensor,
         x: Tensor,
-        t: Tensor,
+        t: Tensor, # a real value 
         prior_score_fun: Callable[[Tensor, Tensor], Tensor] = None,
         clf_free_guidance: bool = False,
         **kwargs,
@@ -507,13 +552,13 @@ class NSE(nn.Module):
             kwargs: Additional args for the score function.
 
         Returns:
-            : The factorized score, of shape `(n, m)`.
+            : The factorized score, of shape `(n, m)` for time t "ONLY".
         """
         # Defining variables
         n_observations = x.shape[0] if len(x.shape) > 1 else 1
         n_samples = theta.shape[0]
-
         # Calculating m, Sigma and scores for the posteriors
+        # approx the noise espsilon and relate to the score via score_t=-espilon_t/sigma_t
         if self.net_type == "fnet":
             scores = self(
                 theta[:, None, :]
@@ -526,9 +571,29 @@ class NSE(nn.Module):
                 **kwargs,
             ) / -self.sigma(t)
             scores = scores.reshape(n_samples, n_observations, -1)
-        else:
-            scores = self.score(theta[:, None], x[None, :], t, **kwargs).detach()
+        
+        elif self.net_type == "analytical":
 
+            #scores = self.score(theta[:, None], x[None, :], t).detach() 
+            
+            scores = vmap(
+                    lambda theta: vmap(
+                        partial(self.score, t=t),
+                        in_dims=(None, 0),
+                        randomness="different",
+                    )(theta, x),
+                    randomness="different",
+                )(theta)
+            
+        elif self.net_type == "gaussian":
+            scores = self.score(theta[:, None], x[None, :], t).detach()  
+            
+        else:
+            scores = self.score(theta[:, None], x[None, :], t, **kwargs).detach() 
+            #size : (n_samples, n_observations, dim theta)
+            # if torch.isnan(scores[0,0,0]):
+            #     print(t)
+                #print("post scores",scores[:5,:])
         if clf_free_guidance:
             x_ = torch.zeros_like(x[0])
             if "n" in kwargs:
@@ -537,8 +602,14 @@ class NSE(nn.Module):
                 theta[:, None], x_[None, :], t, **kwargs_score_prior
             ).detach()[:, 0, :]
         else:
-            prior_score = prior_score_fun(theta[None], t)[0]
-        aggregated_score = (1 - n_observations) * prior_score + scores.sum(axis=1)
+            prior_score = prior_score_fun(theta[None], t)#[0]
+            # size (n-samples, dim theta)
+            # if torch.isnan(prior_score[0,0]):
+            #     print(t)
+                #print("facct score prior",prior_score[:5,:])
+        aggregated_score = (1 - n_observations) * prior_score + scores.sum(axis=1) #why no (T-t) power as in Geffner ?
+        # ATTENTION change here for the score
+        #aggregated_score = (1 - n_observations) * (1-t) * prior_score + scores.sum(axis=1) #why no (T-t) power as in Geffner ?
         return aggregated_score
 
     def factorized_score(
@@ -585,7 +656,7 @@ class NSE(nn.Module):
         """
         # device
         n_obs = x_obs.shape[0]
-        prec_0_t, _, scores = self.tweedies_approximator(
+        prec_0_t, _, scores = self.tweedies_approximator( #get Sigma_t,j^-1 and s_j for all j
             x=x_obs,
             theta=theta,
             nse=self,
@@ -594,6 +665,8 @@ class NSE(nn.Module):
             dist_cov_est=dist_cov_est,
             mode=cov_mode,
         )
+        # scores of size (n_samples, n_obs, dim theta)
+        # Sigma_j,t of size (n_samples, n_obs, dim theta x dim theta)
 
         if clf_free_guidance:
             x_ = torch.zeros_like(x_obs[0][None, :])
@@ -634,25 +707,24 @@ class NSE(nn.Module):
                 weighted_scores = prec_score_prior + (
                     prec_score_post - prec_score_prior[:, None]
                 ).sum(dim=1)
-
+                
                 total_score = torch.linalg.solve(A=lda, B=weighted_scores)
 
-            else:
-                prior_score = prior_score_fn(theta, t)
+            else: #case when the prior is not gaussian
+                prior_score = prior_score_fn(theta, t) # size (n-samples, dim theta)
                 total_score = (1 - n_obs) * prior_score + scores.sum(dim=1)
                 if (self.alpha(t) ** 0.5 > 0.5) and (n_obs > 1):
-                    prec_prior_0_t, _, _ = tweedies_approximation_prior(
+                    prec_prior_0_t, _, _ = tweedies_approximation_prior(# compute Sigma_lambda,t with JAC mode
                         theta, t, prior_score_fn, nse=self
-                    )
+                    )# size (n_samples, dim theta x dim theta)
                     prec_score_prior = (prec_prior_0_t @ prior_score[..., None])[..., 0]
                     prec_score_post = (prec_0_t @ scores[..., None])[..., 0]
                     lda = prec_prior_0_t * (1 - n_obs) + prec_0_t.sum(dim=1)
                     weighted_scores = prec_score_prior + (
                         prec_score_post - prec_score_prior[:, None]
                     ).sum(dim=1)
-
-                    total_score = torch.linalg.solve(A=lda, B=weighted_scores)
-
+            
+                    total_score = torch.linalg.solve(A=lda, B=weighted_scores)# size (n_samples, dim theta)
         return total_score  # / (1 + (1/n_obs)*torch.abs(total_score))
 
 
@@ -689,17 +761,58 @@ class NSELoss(nn.Module):
         Returns:
            : The noise parametrized scalar DSM loss `l`.
         """
-
-        t = torch.rand(theta.shape[0], dtype=theta.dtype, device=theta.device)
-
-        scaling = self.estimator.alpha(t) ** 0.5
-        sigma = self.estimator.sigma(t)
+        eps_t=1e-5
+        t = torch.rand(theta.shape[0], dtype=theta.dtype, device=theta.device)#uniform t in eps_t,1        
+        scaling = self.estimator.alpha(t) ** 0.5 #mean of the transition kernel from 0 to t
+        sigma = self.estimator.sigma(t) #std of the transition kernel from 0 to t
 
         eps = torch.randn_like(theta)
-        theta_t = scaling[:, None] * theta + sigma[:, None] * eps
+        theta_t = scaling[:, None] * theta + sigma[:, None] * eps # corresp to the diffused theta_0 at time t
 
-        return (self.estimator(theta_t, x, t, **kwargs) - eps).square().mean()
+        return (self.estimator(theta_t, x, t, **kwargs) - eps).square().mean() #loss of the denoiser SM
+        #return (((1-scaling**2)**0.5)[...,None]*self.estimator(theta_t, x, t, **kwargs) + eps).square().mean() #loss of the denoiser SM
 
+
+class ExplicitLoss(nn.Module):
+    
+    def __init__(self, inv_cov_prior, mu_prior, inv_cov_lik, cov_post, estimator: NSE):
+        super().__init__()
+
+        self.estimator = estimator
+        self.cov_post=cov_post
+        self.inv_cov_lik=inv_cov_lik
+        self.inv_cov_prior = inv_cov_prior
+        self.mu_prior = mu_prior
+
+    def forward(self, theta: Tensor, x: Tensor, **kwargs) -> Tensor:
+        r"""
+        Args:
+            theta: The parameters `theta`, of shape `(N, m)`.
+            x: The observation `x`, of shape `(N, d)`.
+            kwargs: Additional args for the forward method of the estimator.
+
+        Returns:
+           : The noise parametrized scalar DSM loss `l`.
+        """
+        eps_t=1e-3
+        t = eps_t+(1-eps_t)*torch.rand(theta.shape[0], dtype=theta.dtype, device=theta.device)#uniform t in eps_t,1
+        scaling = self.estimator.alpha(t) ** 0.5 #mean of the transition kernel from 0 to t
+        sigma = self.estimator.sigma(t) #std of the transition kernel from 0 to t
+        eps = torch.randn_like(theta)
+        sigma_2 = sigma**2
+        scaling_2 = scaling**2
+        cov_diff = sigma_2[...,None,None]*torch.eye(theta.shape[1]).repeat(theta.shape[0],1,1)
+        cov_diff+= scaling_2[...,None,None]*self.cov_post.repeat(theta.shape[0],1,1)
+        #size (batch size,2,2)
+        inv_cov_diff = torch.linalg.inv(cov_diff)
+
+        theta_t = scaling[:, None] * theta + sigma[:, None] * eps # corresp to the diffused theta_0 at time t
+        mu_post = self.cov_post@(self.inv_cov_lik@x.reshape(2,x.size(0)) + self.inv_cov_prior@self.mu_prior.reshape(2,1))
+        #size (2,batch size)
+        rescaling = theta_t-scaling[...,None]*torch.transpose(mu_post,0,1)
+        tmp = (self.estimator(theta_t, x, t, **kwargs) + (inv_cov_diff@rescaling[...,None]).squeeze()).square()
+        #return (self.estimator(theta_t, x, t, **kwargs) + (inv_cov_diff@rescaling[...,None]).squeeze()).square().mean() #loss of the denoiser SM
+        return (sigma_2[...,None]*tmp).mean() #loss of the denoiser SM
 
 if __name__ == "__main__":
     theta = torch.randn(128, 2)
