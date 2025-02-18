@@ -19,7 +19,7 @@ num_train = total_budget_train
 n_epochs=3000
 batch_size=500
 n_samples=1000
-type_net="default"
+type_net="gaussian"
 cov_mode="GAUSS"
 training = False
 sampling = not training
@@ -121,6 +121,13 @@ def sigma(t): #std of the transition kernel
     
 score_network.sigma=sigma
 
+def true_matrices(t):
+    alpha=score_network.alpha(t)
+    A = (1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t.shape[0],1,1))+alpha[...,None]*(cov_post.repeat(t.shape[0],1,1)))
+    B = -alpha[...,None]**0.5 * (cov_post@torch.linalg.inv(cov_lik)).repeat(t.shape[0],1,1)
+    C = -alpha**0.5*(cov_post@torch.linalg.inv(cov_prior)@mu_prior).repeat(t.shape[0],1)
+    return A.reshape(A.size(0),-1),B.reshape(B.size(0),-1),C
+
 def score_fnet(theta,x,t): #score estimated by the neural network
     sigma=score_network.sigma(t)
     if t.dim()>0:
@@ -145,8 +152,8 @@ if type_net=="fnet":
 if type_net=="analytical":
     score_network.score=analytical_score_gaussian
 
-if type_net=="gaussian":
-    score_network.score=score_gaussian
+# if type_net=="gaussian":
+#     score_network.score=score_gaussian
 
 score_network.tweedies_approximator = tweedies_approximation
 
@@ -201,7 +208,8 @@ if sampling:
     tmp_x = simulator1(tmp_beta)
     # times = torch.tensor([0.0,0.1,0.25,0.5,1.0])
     time = torch.linspace(1e-3,1.0,1000)
-
+    print("est matrix A",score_network.net.est_matrices(time.unsqueeze(1))[2].size())
+    print("true matrices",true_matrices(time.unsqueeze(1))[2].size())
     true_score=true_diff_post_score(tmp_beta,tmp_x,torch.ones(1)*time[0].item(),score_network).reshape(1,2)
     est_score=score_network.score(theta=tmp_beta,x=tmp_x,t=time[0].item()*torch.ones(1)).detach()
     for i in range(1,time.size(0)):
@@ -210,6 +218,18 @@ if sampling:
         tmp_true=true_diff_post_score(tmp_beta,tmp_x,torch.ones(1)*t,score_network).reshape(1,2)
         true_score = torch.cat((true_score,tmp_true), dim=0)
         est_score = torch.cat((est_score,tmp_est), dim=0)
+
+    true_A, true_B, true_C = true_matrices(time.unsqueeze(1))
+    est_A, est_B, est_C=score_network.net.est_matrices(time.unsqueeze(1))
+    
+    plt.figure(figsize=(10,10))
+    plt.plot(time,((true_A-est_A)**2).mean(dim=1), label="A")
+    plt.plot(time,((true_B-est_B)**2).mean(dim=1), label="B")
+    plt.plot(time,((true_C-est_C)**2).mean(dim=1), label="C")
+    plt.legend()
+    plt.xlabel(r"$t$")
+    plt.title(r"Difference in $L_2-$norm between true and estimated matrices")
+    plt.show()
 
     print("#########################################")
     plt.figure(figsize=(15,15))

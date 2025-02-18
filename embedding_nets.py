@@ -190,6 +190,8 @@ class GaussianNet(torch.nn.Module):
             torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
             torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
+            torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, output_dim*output_dim, bias=True),
         )
         self.C_t = torch.nn.Sequential(
@@ -201,6 +203,9 @@ class GaussianNet(torch.nn.Module):
             torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, output_dim, bias=True),        
         )
+
+    def est_matrices(self,t):
+        return self.A_t(t).detach(), self.B_t(t).detach(), self.C_t(t).detach()
 
     def alpha_t(self,t):
         log_alpha = 0.5 * 19.9 * (t**2) + 0.1 * t
