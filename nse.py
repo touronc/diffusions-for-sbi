@@ -14,7 +14,7 @@ from zuko.utils import broadcast
 from torch.func import vmap
 
 
-from embedding_nets import FNet, GaussianNet
+from embedding_nets import FNet, GaussianNet, GaussianNetAlpha
 from tall_posterior_sampler import (
     prec_matrix_backward,
     tweedies_approximation,
@@ -100,6 +100,10 @@ class NSE(nn.Module):
             self.net = GaussianNet(
                 hidden_dim=16, output_dim=theta_dim
             )
+
+        elif net_type == "gaussian_alpha":
+            self.net = GaussianNetAlpha(hidden_dim=10)
+
         else:
             raise NotImplementedError("Unknown net_type")
 
@@ -166,7 +170,7 @@ class NSE(nn.Module):
         elif self.net_type == "fnet":
             return self.net(theta, x, t)
         
-        elif self.net_type == "gaussian" or self.net_type == "analytical":
+        elif self.net_type == "gaussian" or self.net_type == "analytical" or self.net_type == "gaussian_alpha":
             return self.net(theta,x,t)
         
     # The following function define the VP SDE with linear noise schedule beta(t):
@@ -291,7 +295,7 @@ class NSE(nn.Module):
             score_fun = partial(self.score, **kwargs)
         else: #call the factorized score function if nb of obs >1
             score_fun = partial(self.factorized_score, **kwargs)
-        eps_s=1e-3
+        eps_s=1e-2
         time = eps_s+(1-eps_s)*torch.linspace(1, 0, steps + 1).to(x)
         dt = 1 / steps
         
@@ -491,7 +495,7 @@ class NSE(nn.Module):
             verbose: If True, displays a progress bar, default is False.
             kwargs: Additional args for the score function.
         """
-        eps_s=1e-3
+        eps_s=1e-2
         time = eps_s+(1-eps_s)*torch.linspace(1, 0, steps + 1).to(x)
         # start from a normal standard variable
         # t runs reversely (from 1 to 0)
@@ -585,7 +589,7 @@ class NSE(nn.Module):
                     randomness="different",
                 )(theta)
             
-        elif self.net_type == "gaussian":
+        elif self.net_type == "gaussian" or self.net_type == "gaussian_alpha":
             scores = self.score(theta[:, None], x[None, :], t).detach()  
             
         else:

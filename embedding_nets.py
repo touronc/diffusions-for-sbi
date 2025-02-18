@@ -230,15 +230,15 @@ class GaussianNet(torch.nn.Module):
             cut=True
 
         alpha=self.alpha_t(t_tmp)
-        A=(self.A_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
+        #A=(self.A_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
         #size (batch_size,2,2)
-        #A=(1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t_tmp.shape[0],1,1))+alpha[...,None]*(self.cov_post.repeat(t_tmp.shape[0],1,1)))
-        B=(self.B_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
+        A=(1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t_tmp.shape[0],1,1))+alpha[...,None]*(self.cov_post.repeat(t_tmp.shape[0],1,1)))
+        #B=(self.B_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
         #size (batch_size,2,2)
-        #B = self.alpha_t(t_tmp)[...,None]**0.5 * (self.cov_post@self.inv_cov_lik).repeat(t_tmp.shape[0],1,1)
+        B = -self.alpha_t(t_tmp)[...,None]**0.5 * (self.cov_post@self.inv_cov_lik).repeat(t_tmp.shape[0],1,1)
         C = self.C_t(t_tmp)
         #size (batch_size,2)
-        #C = self.alpha_t(t_tmp)**0.5*(self.cov_post@self.inv_cov_prior@self.mu_prior).repeat(t_tmp.shape[0],1)
+        #C = -self.alpha_t(t_tmp)**0.5*(self.cov_post@self.inv_cov_prior@self.mu_prior).repeat(t_tmp.shape[0],1)
         # score = (A@theta[...,None])[:,:,0] + (B@x[...,None])[:,:,0] + C
         score = A@((theta[...,None])[:,:,0] + (B@x[...,None])[:,:,0] + C)[...,None]
         # size(batch size,2)
@@ -249,4 +249,51 @@ class GaussianNet(torch.nn.Module):
             return score[0,:,0]
         else:
             return score[:,:,0]
+
+
+class GaussianNetAlpha(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.mu_prior = torch.ones(2)
+        self.inv_cov_prior=torch.eye(2)*1.0/3
+        self.inv_cov_lik=torch.eye(2)*1.0/2
+        self.cov_post=torch.linalg.inv(self.inv_cov_prior+self.inv_cov_lik)
         
+        self.scaling_alpha = torch.nn.Sequential(
+            torch.nn.Linear(1, hidden_dim, bias=True),
+            #torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim, bias=True),
+            #torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, 1, bias=True),
+            torch.nn.Sigmoid()
+        )
+        
+    
+    def forward(self, theta, x, t):
+        t_tmp=t
+        cut=False # to adapt the size of the return score to the input variables
+        if t.ndim==0:
+            t_tmp=torch.tensor([t])
+        t_tmp=t_tmp.unsqueeze(1)
+
+        if theta.shape[0]!=x.shape[0]:
+            theta, x = broadcast(theta, x, ignore=1)
+        
+        if theta.ndim==1:
+            theta=theta.unsqueeze(0)
+            x=x.unsqueeze(0)
+            cut=True
+
+        alpha=self.scaling_alpha(t_tmp)
+        #size (batch_size,2,2)
+        A=(1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t_tmp.shape[0],1,1))+alpha[...,None]*(self.cov_post.repeat(t_tmp.shape[0],1,1)))
+        #size (batch_size,2,2)
+        B = -alpha[...,None]**0.5 * (self.cov_post@self.inv_cov_lik).repeat(t_tmp.shape[0],1,1)
+        #size (batch_size,2)
+        C = -alpha**0.5*(self.cov_post@self.inv_cov_prior@self.mu_prior).repeat(t_tmp.shape[0],1)
+        score = A@((theta[...,None])[:,:,0] + (B@x[...,None])[:,:,0] + C)[...,None]
+        # size(batch size,2)
+        if cut:
+            return score[0,:,0]
+        else:
+            return score[:,:,0]

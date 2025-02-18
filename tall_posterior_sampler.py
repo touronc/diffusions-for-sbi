@@ -279,7 +279,7 @@ def euler_sde_sampler(
 ):
     "sample from the true tall posterior with reverse SDE and euler step"
     #start with a gaussian sample from p_T(theta|x)
-    eps_s=1e-3
+    eps_s=1e-2
     theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
     time_pts = eps_s + (1-eps_s)*torch.linspace(1, 0, 1000).to(device)  # (ntime_pts,)
     theta_list = [theta_t]
@@ -350,8 +350,9 @@ def heun_ode_sampler(
 ):
     "sample from the true tall posterior with reverse SDE and euler step"
     #start with a gaussian sample from p_T(theta|x)
+    eps_s=1e-2
     theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
-    time_pts = torch.linspace(1, 0, 1000).to(device)  # (ntime_pts,)
+    time_pts = eps_s+(1-eps_s)*torch.linspace(1, 0, 1000).to(device)  # (ntime_pts,)
     theta_list = [theta_t]
     
     for i in tqdm(range(len(time_pts) - 1)):
