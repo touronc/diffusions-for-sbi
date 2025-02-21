@@ -167,6 +167,10 @@ class FakeFNet(torch.nn.Module):
 
 
 class GaussianNet(torch.nn.Module):
+    """
+    Score network that mimics the true shape of the posterior score and learn 3 matrices A_t, B_t, C_t
+    The forward path looks like A_t(theta + B_t x + C_t)
+    """
     def __init__(self, hidden_dim, output_dim):
         super().__init__()
         self.output_dim=output_dim
@@ -208,7 +212,7 @@ class GaussianNet(torch.nn.Module):
         return self.A_t(t).detach(), self.B_t(t).detach(), self.C_t(t).detach()
 
     def alpha_t(self,t):
-        log_alpha = 0.5 * 19.9 * (t**2) + 0.1 * t
+        log_alpha = 0.5 * 39.9 * (t**2) + 0.1 * t
         return torch.exp(-log_alpha)
     
     def forward(self, theta, x, t):
@@ -217,9 +221,6 @@ class GaussianNet(torch.nn.Module):
         if t.ndim==0:
             t_tmp=torch.tensor([t])
         t_tmp=t_tmp.unsqueeze(1)
-        # print("theta bef net", theta.size())
-        # print("x bef net", x.size())
-        # print("t bef net", t.size())
 
         if theta.shape[0]!=x.shape[0]:
             theta, x = broadcast(theta, x, ignore=1)
@@ -230,21 +231,18 @@ class GaussianNet(torch.nn.Module):
             cut=True
 
         alpha=self.alpha_t(t_tmp)
-        #A=(self.A_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
+        A=(self.A_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
         #size (batch_size,2,2)
-        A=(1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t_tmp.shape[0],1,1))+alpha[...,None]*(self.cov_post.repeat(t_tmp.shape[0],1,1)))
-        #B=(self.B_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
+        #A=(1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t_tmp.shape[0],1,1))+alpha[...,None]*(self.cov_post.repeat(t_tmp.shape[0],1,1)))
+        B=(self.B_t(t_tmp)).reshape(t_tmp.shape[0],self.output_dim,self.output_dim)
         #size (batch_size,2,2)
-        B = -self.alpha_t(t_tmp)[...,None]**0.5 * (self.cov_post@self.inv_cov_lik).repeat(t_tmp.shape[0],1,1)
+        #B = -self.alpha_t(t_tmp)[...,None]**0.5 * (self.cov_post@self.inv_cov_lik).repeat(t_tmp.shape[0],1,1)
         C = self.C_t(t_tmp)
         #size (batch_size,2)
         #C = -self.alpha_t(t_tmp)**0.5*(self.cov_post@self.inv_cov_prior@self.mu_prior).repeat(t_tmp.shape[0],1)
-        # score = (A@theta[...,None])[:,:,0] + (B@x[...,None])[:,:,0] + C
         score = A@((theta[...,None])[:,:,0] + (B@x[...,None])[:,:,0] + C)[...,None]
         # size(batch size,2)
-        
-        # print("in net score",score.size())
-        # print("t in net", t.ndim)
+    
         if cut:
             return score[0,:,0]
         else:
@@ -252,6 +250,10 @@ class GaussianNet(torch.nn.Module):
 
 
 class GaussianNetAlpha(torch.nn.Module):
+    """
+    Score network that only learns the function alpha(t)
+    and return the score with this learnt function
+    """
     def __init__(self, hidden_dim):
         super().__init__()
         self.mu_prior = torch.ones(2)
@@ -268,7 +270,6 @@ class GaussianNetAlpha(torch.nn.Module):
             torch.nn.Sigmoid()
         )
         
-    
     def forward(self, theta, x, t):
         t_tmp=t
         cut=False # to adapt the size of the return score to the input variables
