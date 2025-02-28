@@ -79,17 +79,6 @@ def tweedies_approximation(
                 )
             )(theta) #compute the jacobian of the score
         
-        # if nse.net_type == "gaussian":
-        #     print(theta.size())
-        #     print(x.size())
-        #     def score_jac(theta, x):
-        #         score = vmap(lambda x : score_fn(theta=theta, t=t,x=x),in_dims=0)(x)
-        #         return score, score
-        #     print("jac score",score_jac(theta,x)[0].size())
-        #     print(len(jacrev(score_jac,argnums=0)(theta,x)))
-        #     jac_score = vmap(lambda theta: jacrev(score_jac,argnums=0)(theta,x),
-        #                      randomness="different")(x)
-        #     print("output",jac_score.size())
         else:
 
             def score_jac(theta, x):
@@ -135,20 +124,7 @@ def tweedies_approximation(
                 return score, score
             
             score = score_jac(theta, x)[0]
-        # if nse.net_type == "gaussian":
-        #     # print("theta in tweedie",theta.size())
-        #     # print("x in tweedie",x.size())
-        #     score = score_fn(theta,x,t)
-            # score = vmap(
-            #         lambda theta: vmap(
-            #             partial(score_fn, t=t),
-            #             in_dims=(None, 0),
-            #             randomness="different",
-            #         )(theta, x),
-            #         randomness="different",
-            #     )(theta)
-            #score=score.squeeze(2)
-            #print("score gauss", score.size())
+        
         else:
             if not partial_factorization:  
                 score = vmap(
@@ -223,8 +199,7 @@ def diffused_tall_posterior_score(
         dist_cov_est=dist_cov_est, #this estimate is for GAUSS algo only, corresp to the cov of t=0 indiv posterior
         mode=cov_mode,
     )
-    # if t>0.1680 and t<0.1730:
-    #     print("prec 0 t",prec_0_t)
+
     prior_score = prior_score_fn(theta, t)
 
     if prior_type == "gaussian":
@@ -232,23 +207,17 @@ def diffused_tall_posterior_score(
         prec_prior_0_t = prec_matrix_backward(t, prior.covariance_matrix, nse).repeat(#use the formula for a gaussian initial distribution
             theta.shape[0], 1, 1
         ) #return diff inv cov at time t (Sigma_t,lambda^-1) if initial data is gaussian
-        # if t>0.15 and t<0.19:
-        #     print(prec_prior_0_t)
+
         prec_score_prior = (prec_prior_0_t @ prior_score[..., None])[..., 0] #Sigma_lambda,t^-1 @ s_lambda
         
         prec_score_post = (prec_0_t @ scores[..., None])[..., 0] # Sigma_t,j^-1 @ s_j for all j
-        # if t>0.1680 and t<0.1730:
-            #print("prec score post",prec_score_post)
+
         lda = prec_prior_0_t * (1 - n_obs) + prec_0_t.sum(dim=1) #big lambda
         weighted_scores = prec_score_prior + (
             prec_score_post - prec_score_prior[:, None] #corresp to tilde s (algo GAUSS)
         ).sum(dim=1)
         total_score = torch.linalg.solve(A=lda, B=weighted_scores)
-        # if t>0.1680 and t<0.1730 and cov_mode=="GAUSS":
-        #     #print("prec score post", prec_score_post)
-        #     print("weig",weighted_scores.size())
-        #     print("lda",lda)
-        #     print("total score",total_score)
+
     else:
         total_score = (1 - n_obs) * prior_score + scores.sum(dim=1) #why ?
         if (nse.alpha(t) ** 0.5 > 0.5) and (n_obs > 1):
@@ -263,8 +232,7 @@ def diffused_tall_posterior_score(
             ).sum(dim=1) #corresp to tilde_s
             
             total_score = torch.linalg.solve(A=lda, B=weighted_scores)
-    # if t>0.1680 and t<0.1730 and cov_mode=="GAUSS":
-    #         print("total score before end fct",total_score)
+
     return total_score  # / (1 + (1/n_obs)*torch.abs(total_score))
 
 
@@ -277,7 +245,7 @@ def euler_sde_sampler(
     debug=False,
     theta_clipping_range=(None, None),
 ):
-    "sample from the true tall posterior with reverse SDE and euler step"
+    """sample from the true tall posterior with reverse SDE and euler step"""
     #start with a gaussian sample from p_T(theta|x)
     eps_s=1e-2
     theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
@@ -348,7 +316,7 @@ def heun_ode_sampler(
     device="cpu",
     theta_clipping_range=(None, None),
 ):
-    "sample from the true tall posterior with reverse SDE and euler step"
+    """sample from the true tall posterior with reverse ODE (probability flow) and 2nd order scheme"""
     #start with a gaussian sample from p_T(theta|x)
     eps_s=1e-2
     theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
