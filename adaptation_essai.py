@@ -16,10 +16,10 @@ n_epochs=3000
 batch_size=500
 n_samples=1000 #during the sampling phase
 
-type_net="gaussian" #choices are "gaussian","gaussian_alpha","default","fnet"
-cov_mode="GAUSS" #choices are "GAUSS" or "JAC"
+type_net="gaussian" #choices are "gaussian" (estimate matrices A_t, B_t, C_t),"gaussian_alpha" (estimate only alpha_t),"default","fnet"
+cov_mode="GAUSS" #choices are "GAUSS" or "JAC" (for the estimation of the tall posterior score)
 training = True #to train the neural net estimating the score
-sampling = not training #to sample from a already train neural net
+sampling = not training #to sample from a already trained neural net
 loss_type="denoising" #choices are "denoising", "analytical"
 
 # definition of the prior distribution
@@ -29,42 +29,42 @@ prior_beta = torch.distributions.MultivariateNormal(mu_prior, cov_prior)
 cov_lik = torch.eye(2)*2
 
 def simulator1(theta):
-    "definition of the likelihood/model"
+    """definition of the likelihood/model"""
     return torch.distributions.MultivariateNormal(theta, cov_lik).sample() 
 
 # covariance of the true individual posterior
 cov_post = torch.linalg.inv(torch.linalg.inv(cov_prior)+torch.linalg.inv(cov_lik))
 
 def mu_post(x):
-    "mean of the individual posterior p(theta|x)"
+    """mean of the individual posterior p(theta|x)"""
     return cov_post@(torch.linalg.inv(cov_lik)@x.reshape(2,1) + torch.linalg.inv(cov_prior)@mu_prior.reshape(2,1))
 
 def true_post_score(theta,x):
-    "analytical score of the true individual posterior"
+    """analytical score of the true individual posterior"""
     return -torch.linalg.inv(cov_post)@(theta.reshape(2,1)-mu_post(x))
 
 def true_diff_post_score(theta,x,t, score_net):
-    "analytical score of the true individual diffused posterior p_t(theta|x)"
+    """analytical score of the true individual diffused posterior p_t(theta|x)"""
     alpha_t = score_net.alpha(t).item()
     return -torch.linalg.inv((1-alpha_t)*torch.eye(2)+alpha_t*cov_post)@(theta.reshape(2,1)-alpha_t**0.5*mu_post(x))
 
 def cov_tall_post(x):
-    "covariance matrix of the tall true posterior p(theta|x0,...xn)"
+    """covariance matrix of the tall true posterior p(theta|x0,...xn)"""
     return torch.linalg.inv(torch.linalg.inv(cov_prior)+x.shape[0]*torch.linalg.inv(cov_lik))
 
 def mu_tall_post(x):
-    "mean of the true tall posterior"
+    """mean of the true tall posterior"""
     tmp = torch.linalg.inv(cov_prior)@mu_prior.reshape(2,1)
     for i in range(x.shape[0]):
         tmp += torch.linalg.inv(cov_lik)@x[i,:].reshape(2,1)
     return cov_tall_post(x)@tmp
 
 def true_tall_post_score(theta,x):
-    "analytical score of the true tall posterior p(theta|x_0,...x_n)"
+    """analytical score of the true tall posterior p(theta|x_0,...x_n)"""
     return -torch.linalg.inv(cov_tall_post(x))@(theta.reshape(2,1)-mu_tall_post(x))
 
 def true_diff_tall_post_score(theta, x,t,score_net):
-    "analytical score of the true diffused tall posterior p_t(theta|x_0,...x_n)"
+    """analytical score of the true diffused tall posterior p_t(theta|x_0,...x_n)"""
     alpha_t = score_net.alpha(t)
     return -torch.linalg.inv((1-alpha_t)*torch.eye(2)+alpha_t*cov_tall_post(x))@(theta.reshape(2,1)-alpha_t**0.5*mu_tall_post(x))
 
@@ -81,7 +81,7 @@ score_network = NSE(theta_dim=beta_train.size(1),
                     x_dim=x_train.size(1),
                     net_type=type_net,
                     freqs=1,
-                    hidden_features=[32,32])#, net_type="fnet")
+                    hidden_features=[32,32])
 print(score_network)
 
 #define losses (explicit form or denoising approximation)
@@ -117,7 +117,7 @@ def sigma(t):
 score_network.sigma=sigma
 
 def true_matrices(t):
-    "if we train a network whose architecture is adapted to the true score, return the true matrices A_t, B_t, C_t"
+    """if we train a network whose architecture is adapted to the true score, return the true matrices A_t, B_t, C_t"""
     alpha=score_network.alpha(t)
     A = (1-alpha)[...,None]**0.5*torch.linalg.inv((1-alpha)[...,None]*(torch.eye(2).repeat(t.shape[0],1,1))+alpha[...,None]*(cov_post.repeat(t.shape[0],1,1)))
     B = -alpha[...,None]**0.5 * (cov_post@torch.linalg.inv(cov_lik)).repeat(t.shape[0],1,1)
@@ -139,17 +139,11 @@ def analytical_score_gaussian(theta,x,t):# analytical score for individual poste
     tmp_score= -torch.linalg.inv((1-alpha_t)*torch.eye(2)+alpha_t*cov_post)@(theta_tmp-alpha_t**0.5*mu_post(x))
     return tmp_score.reshape(theta.size())
 
-def score_gaussian(theta,x,t):
-    return score_network(theta,x,t)
-
 if type_net=="fnet":
     score_network.score=score_fnet
 
 if type_net=="analytical":
     score_network.score=analytical_score_gaussian
-
-# if type_net=="gaussian":
-#     score_network.score=score_gaussian
 
 score_network.tweedies_approximator = tweedies_approximation
 
@@ -260,6 +254,7 @@ if sampling:
     plt.show()
 
     print("################### Tall posterior score ############")
+    # define the number of conditional observations
     n_obs = 20
     # define true additional observations
     tmp_tall_x = simulator1(tmp_beta.repeat(n_obs,1))
