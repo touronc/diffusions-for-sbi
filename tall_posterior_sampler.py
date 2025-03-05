@@ -3,6 +3,7 @@ from functools import partial
 import torch
 from torch.func import jacrev, vmap
 from tqdm import tqdm
+import numpy as np
 
 from vp_diffused_priors import get_vpdiff_gaussian_score
 
@@ -42,8 +43,6 @@ def prec_matrix_backward(t, dist_cov, nse):
     eye = torch.eye(dist_cov.shape[-1]).to(alpha_t.device)
     # Same as the other but using woodberry. (eq 53 or https://arxiv.org/pdf/2310.06721.pdf)
     # return torch.linalg.inv(dist_cov * alpha_t + (sigma_t**2) * eye)
-    # if t>0.1680 and t<0.1730:
-    #     print("prec backward",alpha_t/sigma_t**2)
     return (
         torch.linalg.inv(dist_cov.to(alpha_t.device)) + (alpha_t / sigma_t**2) * eye
     )
@@ -91,7 +90,6 @@ def tweedies_approximation(
                         jacrev(score_jac, has_aux=True), in_dims=(None, 0)
                     )(theta, x)
                 )(theta)
-                #print("jac score",jac_score.size())
             else:
                 jac_score, score = vmap(
                     jacrev(score_jac, has_aux=True), in_dims=(None, 0)
@@ -124,7 +122,7 @@ def tweedies_approximation(
                 return score, score
             
             score = score_jac(theta, x)[0]
-        
+
         else:
             if not partial_factorization:  
                 score = vmap(
@@ -199,7 +197,6 @@ def diffused_tall_posterior_score(
         dist_cov_est=dist_cov_est, #this estimate is for GAUSS algo only, corresp to the cov of t=0 indiv posterior
         mode=cov_mode,
     )
-
     prior_score = prior_score_fn(theta, t)
 
     if prior_type == "gaussian":
@@ -245,7 +242,9 @@ def euler_sde_sampler(
     debug=False,
     theta_clipping_range=(None, None),
 ):
-    """sample from the true tall posterior with reverse SDE and euler step"""
+    """
+    Sample from the true tall posterior with reverse SDE and euler step
+    """
     #start with a gaussian sample from p_T(theta|x)
     eps_s=1e-2
     theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
@@ -272,7 +271,7 @@ def euler_sde_sampler(
                 sigma_posterior_backward,
             ) = score_fn(theta_t, t, debug=True)
         else:
-            score = score_fn(theta_t, t)
+            score = score_fn(theta=theta_t, t=t)
         score = score.detach()
         drift = f - g * g * score #reverse SDE eq (6) p.4
         diffusion = g
@@ -316,7 +315,9 @@ def heun_ode_sampler(
     device="cpu",
     theta_clipping_range=(None, None),
 ):
-    """sample from the true tall posterior with reverse ODE (probability flow) and 2nd order scheme"""
+    """
+    Sample from the true tall posterior with reverse ODE (probability flow) and 2nd order scheme
+    """
     #start with a gaussian sample from p_T(theta|x)
     eps_s=1e-2
     theta_t = torch.randn((nsamples, dim_theta)).to(device)  # (nsamples, 2)
@@ -332,7 +333,7 @@ def heun_ode_sampler(
         f = -0.5 * beta(t) * theta_t
         g = beta(t) ** 0.5
         # estimated score at t_i
-        score = score_fn(theta_t, t)
+        score = score_fn(theta=theta_t, t=t)
         score = score.detach()
         # evaluate dx/dt at t_i
         d_i = f - 0.5 * g * g * score 
@@ -345,7 +346,7 @@ def heun_ode_sampler(
             #compute drift and diffusion at t_i+1 and tmp_x_i+1
             f = -0.5 * beta(t) * tmp_theta_tp1
             g = beta(t) ** 0.5
-            score = score_fn(tmp_theta_tp1, t).detach()
+            score = score_fn(theta=tmp_theta_tp1, t=t).detach()
             # evaluate dx/dt at t_i+1
             d_i_prime = f - 0.5 * g * g * score
             theta_t = theta_t.detach() + dt*(d_i/2 + d_i_prime/2)
@@ -357,6 +358,82 @@ def heun_ode_sampler(
     
     return theta_t, theta_list
 
+def ablation_sampler(
+    net, nsamples, dim_theta, x, num_steps=18, sigma_min=None, sigma_max=None,
+    solver='heun', discretization='vp', schedule='vp', scaling='vp',
+    epsilon_s=1e-3
+):
+    """
+    Deterministic sampling (reverse ODE) with a 2nd order scheme using 
+    the learnt denoiser rather than the score
+    """
+
+    # Helper functions for VP & VE noise level schedules.
+    vp_sigma = lambda beta_d, beta_min: lambda t: (np.e ** (0.5 * beta_d * (t ** 2) + beta_min * t) - 1) ** 0.5
+    vp_sigma_deriv = lambda beta_d, beta_min: lambda t: 0.5 * (beta_min + beta_d * t) * (sigma(t) + 1 / sigma(t))
+    vp_sigma_inv = lambda beta_d, beta_min: lambda sigma: ((beta_min ** 2 + 2 * beta_d * (sigma ** 2 + 1).log()).sqrt() - beta_min) / beta_d
+
+    # Select default noise level range based on the specified time step discretization.
+    if sigma_min is None:
+        vp_def = vp_sigma(beta_d=19.9, beta_min=0.1)(t=epsilon_s) #associated with time t=eps_s
+        sigma_min = vp_def
+    if sigma_max is None:
+        vp_def = vp_sigma(beta_d=19.9, beta_min=0.1)(t=1) #associated with time t=1
+        sigma_max = vp_def
+    
+    # Adjust noise levels based on what's supported by the network.
+    sigma_min = max(sigma_min, net.sigma_min)
+    sigma_max = min(sigma_max, net.sigma_max)
+    print("hey", sigma_min, sigma_max)
+    # Compute corresponding betas for VP.
+    vp_beta_d = 2 * (np.log(sigma_min ** 2 + 1) / epsilon_s - np.log(sigma_max ** 2 + 1)) / (epsilon_s - 1)
+    vp_beta_min = np.log(sigma_max ** 2 + 1) - 0.5 * vp_beta_d
+    print(vp_beta_d,vp_beta_min)
+    # Define time steps in terms of noise level.
+    step_indices = torch.arange(num_steps, dtype=torch.float64)#uniform steps indices between 0, N-1
+    if discretization == 'vp':
+        orig_t_steps = 1 + step_indices / (num_steps - 1) * (epsilon_s - 1) #t is between eps_s and 1 (in the sampler)
+        print(orig_t_steps)
+        sigma_steps = vp_sigma(vp_beta_d, vp_beta_min)(orig_t_steps)
+   
+    # Define noise level schedule.
+    if schedule == 'vp':
+        sigma = vp_sigma(vp_beta_d, vp_beta_min)
+        sigma_deriv = vp_sigma_deriv(vp_beta_d, vp_beta_min)
+        sigma_inv = vp_sigma_inv(vp_beta_d, vp_beta_min)
+
+    # Define scaling schedule.
+    if scaling == 'vp':
+        s = lambda t: 1 / (1 + sigma(t) ** 2).sqrt()
+        s_deriv = lambda t: -sigma(t) * sigma_deriv(t) * (s(t) ** 3)
+
+    # Compute final time steps based on the corresponding noise levels.
+    t_steps = sigma_inv(net.round_sigma(sigma_steps))
+    print("tsteps",t_steps)
+    t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])]) # t_N = 0
+    # Main sampling loop.
+    t_next = t_steps[0]
+    x_next = torch.randn((nsamples,dim_theta)).to(torch.float64) * (sigma(t_next) * s(t_next))
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
+        x_cur = x_next
+        
+        # Euler step.
+        h = t_next - t_cur
+        denoised = net(x_cur / s(t_cur), x, sigma(t_cur)).to(torch.float64)
+        d_cur = (sigma_deriv(t_cur) / sigma(t_cur) + s_deriv(t_cur) / s(t_cur)) * x_cur - sigma_deriv(t_cur) * s(t_cur) / sigma(t_cur) * denoised
+        x_prime = x_cur + h * d_cur
+        t_prime = t_next
+
+        # Apply 2nd order correction.
+        if solver == 'euler' or i == num_steps - 1:
+            x_next = x_prime
+        else:
+            assert solver == 'heun'
+            denoised = net(x_prime / s(t_prime), x, sigma(t_prime)).to(torch.float64)
+            d_prime = (sigma_deriv(t_prime) / sigma(t_prime) + s_deriv(t_prime) / s(t_prime)) * x_prime - sigma_deriv(t_prime) * s(t_prime) / sigma(t_prime) * denoised
+            x_next = x_cur + h * 0.5 * (d_cur +  d_prime)
+
+    return x_next
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
