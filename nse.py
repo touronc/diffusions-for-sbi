@@ -1,6 +1,7 @@
 import math
 from functools import partial
 from typing import Callable, Optional
+import random
 
 import torch
 import torch.nn as nn
@@ -14,7 +15,7 @@ from zuko.utils import broadcast
 from torch.func import vmap
 
 
-from embedding_nets import FNet, GaussianNet, GaussianNetAlpha
+from embedding_nets import FNet, GaussianNet, GaussianNetAlpha, NonCondNet,VPPrecond, VPPrecondnoncond
 from tall_posterior_sampler import (
     prec_matrix_backward,
     tweedies_approximation,
@@ -90,7 +91,16 @@ class NSE(nn.Module):
             self.net = build_net(
                 self.theta_emb_dim + self.x_emb_dim + 2 * freqs, theta_dim, **kwargs
             )
-            
+        
+        elif net_type == "noncond":
+            self.net = NonCondNet(input_dim=theta_dim+1,hidden_dim=32,output_dim=theta_dim)
+        
+        elif net_type == "edm_noncond":
+            self.net =VPPrecondnoncond(theta_dim=theta_dim,hidden_dim=32)
+
+        elif net_type == "edm":
+            self.net =VPPrecond(theta_dim=theta_dim,x_dim=x_dim,hidden_dim=64)
+
         elif net_type == "fnet":
             self.net = FNet(
                 dim_input=theta_dim, dim_cond=x_dim, dim_embedding=128, n_layers=1
@@ -167,6 +177,14 @@ class NSE(nn.Module):
             # concatenate variables and output the estimated noise
             return self.net(torch.cat((theta, x, t), dim=-1))
 
+        elif self.net_type == "noncond":
+            # for the non conditional case
+            return self.net(theta,x,t)
+        
+        elif self.net_type == "edm" or self.net_type == "edm_noncond":
+            # for the EDM training (conditional or not)
+            return self.net(theta,x,t)
+        
         elif self.net_type == "fnet":
             return self.net(theta, x, t)
         
@@ -240,7 +258,6 @@ class NSE(nn.Module):
         """Mean predictor of the backward kernel
         (used in DDIM sampler and gaussian approximation).
         """
-
         upsilon = 1 - alpha_t
         mean = (alpha_t ** (-0.5)) * (theta + upsilon * score)
         return mean
@@ -576,10 +593,7 @@ class NSE(nn.Module):
             ) / -self.sigma(t)
             scores = scores.reshape(n_samples, n_observations, -1)
         
-        elif self.net_type == "analytical":
-
-            #scores = self.score(theta[:, None], x[None, :], t).detach() 
-            
+        elif self.net_type == "analytical":            
             scores = vmap(
                     lambda theta: vmap(
                         partial(self.score, t=t),
@@ -595,9 +609,7 @@ class NSE(nn.Module):
         else:
             scores = self.score(theta[:, None], x[None, :], t, **kwargs).detach() 
             #size : (n_samples, n_observations, dim theta)
-            # if torch.isnan(scores[0,0,0]):
-            #     print(t)
-                #print("post scores",scores[:5,:])
+
         if clf_free_guidance:
             x_ = torch.zeros_like(x[0])
             if "n" in kwargs:
@@ -608,9 +620,7 @@ class NSE(nn.Module):
         else:
             prior_score = prior_score_fun(theta[None], t)#[0]
             # size (n-samples, dim theta)
-            # if torch.isnan(prior_score[0,0]):
-            #     print(t)
-                #print("facct score prior",prior_score[:5,:])
+           
         aggregated_score = (1 - n_observations) * prior_score + scores.sum(axis=1) #why no (T-t) power as in Geffner ?
         # ATTENTION change here for the score
         #aggregated_score = (1 - n_observations) * (1-t) * prior_score + scores.sum(axis=1) #why no (T-t) power as in Geffner ?
@@ -776,7 +786,6 @@ class NSELoss(nn.Module):
         return (self.estimator(theta_t, x, t, **kwargs) - eps).square().mean() #loss of the denoiser SM
         #return (((1-scaling**2)**0.5)[...,None]*self.estimator(theta_t, x, t, **kwargs) + eps).square().mean() #loss of the denoiser SM
 
-
 class ExplicitLoss(nn.Module):
     
     def __init__(self, inv_cov_prior, mu_prior, inv_cov_lik, cov_post, estimator: NSE):
@@ -817,6 +826,62 @@ class ExplicitLoss(nn.Module):
         tmp = (self.estimator(theta_t, x, t, **kwargs) + (inv_cov_diff@rescaling[...,None]).squeeze()).square()
         #return (self.estimator(theta_t, x, t, **kwargs) + (inv_cov_diff@rescaling[...,None]).squeeze()).square().mean() #loss of the denoiser SM
         return (sigma_2[...,None]*tmp).mean() #loss of the denoiser SM
+
+class EDMLoss(nn.Module):
+    r"""Calculates the *denoiser parametrized* denoising score matching (EDM) loss for NSE.
+    Minimizing this loss estimates the denoiser  `D`, from which the score function
+    can be calculated as
+
+        `score(\theta, x, t) = (D(\theta, x, t) - \theta) / sigma(t)^2.
+
+    if \theta is not scaled by a factor s(t) (= \alpha(t)^0.5). Otherwise we get,
+
+        `score(\theta, x, t) = (D(\theta / s(t), x, t) - \theta / s(t)) / (s(t)*sigma(t)^2)`.
+
+    Given a batch of `N` pairs `(theta_i, x_i)`, the module returns `
+        mean(
+            1 / sigma(t_i)^2 ||D(\theta_i + sigma(t_i)*epsilon_i, x_i, t_i) - \theta_i||^2
+        )
+
+    where `t_i ~ U(eps_t, 1)` and `epsilon_i ~ N(0, I)`.
+
+    Args:
+        estimator (NSE): A denoiser `D(\theta, x, t)`.
+    """
+
+    def __init__(self, estimator: NSE):
+        super().__init__()
+
+        self.estimator = estimator
+        self.net = estimator.net
+        self.beta_d = self.net.beta_d
+        self.beta_min = self.net.beta_min
+        self.epsilon_t = self.net.epsilon_t
+
+    def forward(self, theta: Tensor, x: Tensor, **kwargs) -> Tensor:
+        r"""
+        Args:
+            theta: The parameters `theta`, of shape `(N, m)`.
+            x: The observation `x`, of shape `(N, d)`.
+            kwargs: Additional args for the forward method of the estimator.
+
+        Returns:
+           : The denoiser parametrized scalar EDM loss `l`.
+        """
+        
+        steps = random.choices(range(1001),k=theta.shape[0]) # choose time steps randomly among 1000 choices
+        t = torch.tensor(steps,dtype=torch.float32)/1000
+        
+        sigma = self.sigma(1+ t * (self.epsilon_t-1)) #sigma(t_i) with t_i in (eps_t,1) for i in (0,N-1)
+        weight = 1 / sigma ** 2
+        n = torch.randn_like(theta) * sigma[...,None] 
+        D_yn = self.estimator(theta + n, x, sigma) #denoiser returning the clean image
+        loss = weight[...,None] * ((D_yn - theta) ** 2) # loss eq 190 (p 32) to train the denoiser in VP context
+        return 1.0/theta.size(0)*loss.sum()
+    
+    def sigma(self, t):
+        t = torch.as_tensor(t)
+        return ((0.5 * self.beta_d * (t ** 2) + self.beta_min * t).exp() - 1).sqrt()
 
 if __name__ == "__main__":
     theta = torch.randn(128, 2)
