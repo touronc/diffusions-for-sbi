@@ -11,7 +11,7 @@ import pickle
 import ot
 from tqdm.auto import tqdm
 
-DIM=2
+DIM=10
 #from get_true_samples_nextra_obs import get_posterior_samples
 torch.manual_seed(0)
 mu_prior = torch.ones(DIM)
@@ -98,6 +98,7 @@ def wasserstein_dist(mu_1,mu_2,cov_1,cov_2):
     covterm = torch.trace(
         cov_1 + cov_2 - 2 * _matrix_pow(sqrtcov1 @ cov_2 @ sqrtcov1, 0.5)
     )
+
     return ((mu_1-mu_2)**2).sum() + covterm
 
 class FakeNet(nn.Module):
@@ -199,6 +200,38 @@ class FakeNet(nn.Module):
         # print("help",score.shape)
         # print("cov", (mu_tall_post(condition)).shape,cov_diff.shape, vector.shape, score.shape)
         return score.mT + self.error*one_hot
+
+    def compositional_diffusion_error(self,time_steps, error_lda, eps, eps_lda, list_prec_est, x_o_long_full):
+        """returns theoretical bound of proposition 2 in paper"""
+        n_obs = len(x_o_long_full)
+        bound_error_diffusion = []
+        for time in time_steps:
+            alpha_t = self.mean_t(time)**2
+            true_samples = torch.distributions.MultivariateNormal(alpha_t**0.5*mu_tall_post(x_o_long_full).squeeze(1), alpha_t*cov_tall_post(x_o_long_full)+(1-alpha_t)*torch.eye(DIM)).sample((3000,))
+            diff_prec = self.diff_prec(prec_post,time) #true diffused post precisions
+            M_bound = torch.linalg.norm(diff_prec,2) #all the cov are equal in our case
+            diff_prec_prior = self.diff_prec(torch.linalg.inv(cov_prior),time) #true diffused prior precision
+            M_lda = torch.linalg.norm(diff_prec_prior,2)
+            Lda = torch.linalg.inv((1-n_obs)*diff_prec_prior+(n_obs)*diff_prec)
+            norm = torch.linalg.norm(Lda,2)
+            if (n_obs-1)*eps_lda+(n_obs)*eps<1/norm :#and eps_lda<1/M_lda and eps<1/M:
+                L_list = []
+                # list_prec=[] #store covariance of with eps **fixed**
+                list_prec_1=[] #store **estimated** covariance of indiv posterior
+                for i in range(n_obs):
+                    norm_indiv_score = torch.linalg.norm(self.single_posterior_score(true_samples[:,None,:],x_o_long_full[i,:],time),2, dim=(1,2))
+                    # list_prec.append(diff_prec+eps*torch.eye(2)) #Sigma tilde
+                    list_prec_1.append(self.diff_prec(list_prec_est[i],time)) #with estimated cov
+                    L_list.append(torch.mean(norm_indiv_score**2).item())
+                L_sq = torch.max(torch.tensor(L_list))
+                L_lda_sq = torch.mean(torch.linalg.norm(self.prior_score(true_samples[:,None,:],time),2,dim=(1,2))**2) #nsamples,dim,1
+            error_bound_sq = (n_obs-1)*(L_lda_sq**0.5+error_lda)*norm
+            frac = ((n_obs-1)*eps_lda+(n_obs)*eps)*norm/(1-norm*((n_obs-1)*eps_lda+(n_obs)*eps))
+            error_bound_sq*=eps_lda+frac*(M_lda+eps_lda)#*M_lda/(1-M_lda*eps_lda)
+            error_bound_sq+=(n_obs)*(L_sq**0.5+self.error)*norm*(eps+frac*(M_bound+eps))#*M/(1-M*eps))
+            error_bound_sq += norm*((n_obs-1)*M_lda*error_lda+(n_obs)*M_bound*self.error)
+            bound_error_diffusion.append(error_bound_sq)
+        return bound_error_diffusion
     
     def geffner_post_score(self, input, condition, time, error_lda=0):
         """returns the score of a intermediate marginals for annealed Langevin"""
@@ -649,6 +682,7 @@ def main(ctx: mlxp.Context):
                 print("out")
             mu_t = mu_tp1
             cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
                     # B_t = 1.65*M/m*h**0.5*DIM**0.5+error/m
                     # list_B_t.append(B_t)
         list_wass_interm.append((wasserstein_dist(mu_t,torch.zeros(DIM),cov_pi_t, torch.eye(DIM))**0.5).item())
@@ -656,7 +690,6 @@ def main(ctx: mlxp.Context):
         M = torch.linalg.norm(torch.linalg.inv(cov_pi_t),2) #smooth for pi_t
         smooth.append(M)
         concave.append(m)
-                # vals.append(torch.min(torch.linalg.eigvals(prec_pi_t).real).item())
         for error in error_list:
             perturbed_score.error=error
             samples_beta = perturbed_score.annealed_langevin_sampling(num_samples,x_o_long_full,num_langevin_steps,num_time_steps,h,error_lda)
@@ -771,6 +804,7 @@ def main(ctx: mlxp.Context):
                 print("out")
             mu_t = mu_tp1
             cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
             mu_diff_t = mu_diff_tp1
             cov_diff_t = cov_diff_tp1
                     # B_t = 1.65*M/m*h**0.5*DIM**0.5+error/m
@@ -902,6 +936,7 @@ def main(ctx: mlxp.Context):
                 print("out")
             mu_t = mu_tp1
             cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
             
         list_wass_interm.append((wasserstein_dist(mu_t,torch.zeros(DIM),cov_pi_t, torch.eye(DIM))**0.5).item())
         m = torch.min(torch.linalg.eigvals(torch.linalg.inv(cov_pi_t)).real) #strongly concave for pi_t
@@ -915,7 +950,6 @@ def main(ctx: mlxp.Context):
             cov_est = torch.cov(samples_beta.T)
             wass = wasserstein_dist(mu_tall_post(x_o_long_full).squeeze(1),torch.mean(samples_beta,dim=0),cov_tall_post(x_o_long_full),cov_est)**0.5
             plot_final_wass.append(wass.item())
-            
             
             factor_1 = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(1,len(tmp_time_steps)+1))
             factor_2 = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(len(tmp_time_steps)))
@@ -1027,6 +1061,7 @@ def main(ctx: mlxp.Context):
                 print("out")
             mu_t = mu_tp1
             cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
             mu_diff_t = mu_diff_tp1
             cov_diff_t = cov_diff_tp1
             
@@ -1160,6 +1195,7 @@ def main(ctx: mlxp.Context):
                     print("out")
                 mu_t = mu_tp1
                 cov_pi_t = cov_pi_tp1
+                prec_pi_t = prec_pi_tp1
                         # B_t = 1.65*M/m*h**0.5*DIM**0.5+error/m
                         # list_B_t.append(B_t)
             list_wass_interm.append((wasserstein_dist(mu_t,torch.zeros(DIM),cov_pi_t, torch.eye(DIM))**0.5).item())
@@ -1293,6 +1329,7 @@ def main(ctx: mlxp.Context):
                     print("out")
                 mu_t = mu_tp1
                 cov_pi_t = cov_pi_tp1
+                prec_pi_t = prec_pi_tp1
                 mu_diff_t = mu_diff_tp1
                 cov_diff_t = cov_diff_tp1
                         # B_t = 1.65*M/m*h**0.5*DIM**0.5+error/m
@@ -1311,7 +1348,7 @@ def main(ctx: mlxp.Context):
             smooth_j.append(M_j)
             concave_j.append(m_j)
             list_B_t_j.append(1.65*M_j/m_j*h**0.5*DIM**0.5+error/m_j)
-
+            print(smooth[:5], smooth_j[:5], concave[:5], concave_j[:5])
             factor_1 = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(1,len(tmp_time_steps)+1))
             factor_2 = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(len(tmp_time_steps)))
             theo_bound = torch.sum(factor_1*torch.tensor(list_wass_interm))+torch.sum(factor_2*torch.tensor(list_B_t))
@@ -1408,6 +1445,7 @@ def main(ctx: mlxp.Context):
                 print("out")
             mu_t = mu_tp1
             cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
             
         list_wass_interm.append((wasserstein_dist(mu_t,torch.zeros(DIM),cov_pi_t, torch.eye(DIM))**0.5).item())
         m = torch.min(torch.linalg.eigvals(torch.linalg.inv(cov_pi_t)).real) #strongly concave for pi_t
@@ -1524,6 +1562,7 @@ def main(ctx: mlxp.Context):
                 print("out")
             mu_t = mu_tp1
             cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
             mu_diff_t = mu_diff_tp1
             cov_diff_t = cov_diff_tp1
             
@@ -1537,6 +1576,7 @@ def main(ctx: mlxp.Context):
         M_j = torch.linalg.norm(torch.linalg.inv(cov_diff_t),2) #smooth for pi_t
         smooth_j.append(M_j)
         concave_j.append(m_j)
+
         for h in list_step_sizes:
             samples_beta = perturbed_score.annealed_langevin_sampling(num_samples,x_o_long_full,num_langevin_steps,num_time_steps,h,error_lda)
             samples_beta=samples_beta[:,0,:]
@@ -1648,7 +1688,7 @@ def main(ctx: mlxp.Context):
         plt.show()
         print(o)
 
-    if 1:#check diffusion bound gao wrt score error
+    if 0:#check diffusion bound gao wrt nb diffusion steps
         n_obs = cfg.nextra
         dico={}
         extra_obs = [x_o]
@@ -1718,6 +1758,307 @@ def main(ctx: mlxp.Context):
         ax1.loglog(list_diffusion_steps,plot_bound, color="blue",ls="dashed", label="theoretical")
         ax1.set_ylabel(r"$\mathcal{W}^2_2(\rho_0,\pi_0)$",fontsize=12)
         ax1.set_xlabel(r"$T$",fontsize=12)
+        plt.legend()
+        plt.show()
+        print(o)
+
+    if 0:#compar julia geffner diffusion langevin
+        n_obs = cfg.nextra
+        dico={}
+        extra_obs = [x_o]
+        for _ in range(n_obs):
+            extra_obs.append(simulator1(beta_o))
+        x_o_long_full = torch.stack(extra_obs)
+        print("\nDimensions for ", n_obs+1," observations","\n x : ",x_o_long_full.size())
+        n_obs = len(x_o_long_full)
+        dico["n_obs"]=n_obs
+        dico["x_obs"]=x_o_long_full
+        error_lda = 0.01 #error for prior score
+        error_list = torch.linspace(0.001,10,20)#0.5,0.7]
+        dico["error_list"]=error_list
+        num_diffusion_steps = 1000
+        num_time_steps = 400 #for langevin
+        step_size = 1.0/num_diffusion_steps #for diffusion constant step size
+        mu_post_n = mu_tall_post(x_o_long_full).squeeze(1)
+        cov_post_n = cov_tall_post(x_o_long_full)
+        mu_post_full = []
+        for x in x_o_long_full:
+            mu_post_full.append(mu_post(x)[0,:,0])
+        alpha_fn = perturbed_score.mean_t
+        T = 1.0
+        num_langevin_steps = 5
+        h = 1e-3 #step size for langevin
+        true_samples = torch.distributions.MultivariateNormal(mu_post_n, cov_post_n).sample((num_samples,))
+        
+        #for diffusion bound
+        m_0 = torch.min(torch.linalg.eigvals(torch.linalg.inv(cov_post_n)).real) #strongly concave for target pi
+        L_0 = torch.linalg.norm(torch.linalg.inv(cov_post_n),2) #smooth for target pi
+        if L_0<1:
+            L_0=1
+        a = torch.linalg.norm(-perturbed_score.beta_max*cov_post_n+(1+perturbed_score.beta_max)*torch.eye(DIM),2)
+        b = torch.linalg.norm(-perturbed_score.beta_min*cov_post_n+(1+perturbed_score.beta_min)*torch.eye(DIM),2)
+        M_1 = a.item()
+        if a.item()<b.item():
+            M_1=b.item()
+        norm_x_0 = torch.mean(torch.sum(true_samples**2,dim=1), dim=0)
+        norm_x_0 = torch.trace(cov_post_n)+torch.dot(mu_post_n,mu_post_n)
+        init_error = norm_x_0/(m_0/alpha_fn(torch.tensor([T]))**2 + 1 - m_0)
+        tmp_time_steps = torch.linspace(perturbed_score.t_min,perturbed_score.t_max,num_time_steps)# goes from 0 to T-1
+        reverse_time = torch.flip(tmp_time_steps,dims=[0])
+        int_beta = 2*torch.log(alpha_fn(reverse_time[1:])/alpha_fn(reverse_time[:-1]))
+        int_beta_sq = perturbed_score.int_beta_sq_fn(reverse_time[:-1])-perturbed_score.int_beta_sq_fn(reverse_time[1:])
+        denom = m_0/alpha_fn(reverse_time)[1:]**2 + 1 - m_0
+        num = alpha_fn(reverse_time[1:])**(-1-2*M_1*step_size)*torch.exp((step_size/4+4*step_size*L_0**2)*perturbed_score.int_beta_sq_fn(reverse_time[1:]))[:,None]
+        factor_1 = M_1*step_size*(1+2*norm_x_0+DIM**0.5)*int_beta
+        factor_2_2 = step_size**0.5*(0.5+2*L_0)*int_beta_sq[:,None]**0.5
+        factor_3 = alpha_fn(torch.tensor([T]))*norm_x_0*(0.5+2*L_0)*int_beta
+        factor_4 = (norm_x_0**2+DIM)**0.5*0.5*int_beta+DIM**0.5*int_beta**0.5
+
+        plot_final_wass=[]
+        plot_final_wass_lang=[]
+        plot_bound=[]
+        plot_bound_lang=[]
+
+        #for annealed langevin
+        list_wass_interm = [] # W_2(pi_t, pi_t+1)
+        smooth = [] #M_t
+        concave = [] #m_t
+        tmp_time_steps = torch.linspace(perturbed_score.t_min,perturbed_score.t_max,num_time_steps)# goes from 0 to T-1
+        for i in range(len(tmp_time_steps)-1):
+            if i == 0:
+                time = tmp_time_steps[i]
+                alpha_t = perturbed_score.mean_t(time)**2
+                cov_prior_t = alpha_t*cov_prior+(1-alpha_t)*torch.eye(DIM)
+                cov_post_t = alpha_t*cov_post+(1-alpha_t)*torch.eye(DIM)
+                prec_prior_t = torch.linalg.inv(cov_prior_t)
+                prec_post_t = torch.linalg.inv(cov_post_t)
+                prec_pi_t = (1-n_obs)*prec_prior_t+n_obs*prec_post_t
+                cov_pi_t = torch.linalg.inv(prec_pi_t)
+            time_plus_1 = tmp_time_steps[i+1]
+            alpha_tp1 = perturbed_score.mean_t(time_plus_1)**2
+            cov_prior_tp1 = alpha_tp1*cov_prior+(1-alpha_tp1)*torch.eye(DIM)
+            cov_post_tp1 = alpha_tp1*cov_post+(1-alpha_tp1)*torch.eye(DIM)
+            prec_prior_tp1 = torch.linalg.inv(cov_prior_tp1)
+            prec_post_tp1 = torch.linalg.inv(cov_post_tp1)
+            prec_pi_tp1 = (1-n_obs)*prec_prior_tp1+n_obs*prec_post_tp1
+            cov_pi_tp1 = torch.linalg.inv(prec_pi_tp1)
+            if torch.min(torch.linalg.eigvals(prec_pi_t).real).item() > 0:
+                mu_t = (1-n_obs)*alpha_t**0.5*prec_prior_t@mu_prior #(2)
+                mu_tp1 = (1-n_obs)*alpha_tp1**0.5*prec_prior_tp1@mu_prior 
+                sum_t = torch.sum(prec_post_t@torch.stack(mu_post_full).T,dim=1) #(2)
+                sum_tp1 = torch.sum(prec_post_tp1@torch.stack(mu_post_full).T,dim=1)
+                mu_t = mu_t + alpha_t**0.5*sum_t
+                mu_tp1 = mu_tp1 + alpha_tp1**0.5*sum_tp1
+                mu_t = cov_pi_t@mu_t
+                mu_tp1 = cov_pi_tp1@mu_tp1
+                list_wass_interm.append(torch.sqrt(torch.clamp(wasserstein_dist(mu_t,mu_tp1,cov_pi_t,cov_pi_tp1),min=1e-12)).item())
+                m = torch.min(torch.linalg.eigvals(prec_pi_t).real) #strongly concave for pi_t
+                M = torch.linalg.norm(prec_pi_t,2) #smooth for pi_t
+                smooth.append(M)
+                concave.append(m)
+            else:
+                print("out")
+            mu_t = mu_tp1
+            cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
+        list_wass_interm.append((wasserstein_dist(mu_t,torch.zeros(DIM),cov_pi_t, torch.eye(DIM))**0.5).item())
+        m = torch.min(torch.linalg.eigvals(torch.linalg.inv(cov_pi_t)).real) #strongly concave for pi_t
+        M = torch.linalg.norm(torch.linalg.inv(cov_pi_t),2) #smooth for pi_t
+        smooth.append(M)
+        concave.append(m)
+
+        for error in error_list:
+            perturbed_score.error=error
+            samples_beta = perturbed_score.sampling(num_samples,num_diffusion_steps,x_o_long_full)[:,0,:]
+            cov_est = torch.cov(samples_beta.T)
+            wass = wasserstein_dist(mu_post_n,torch.mean(samples_beta,dim=0),cov_post_n,cov_est)**0.5
+            plot_final_wass.append(wass.item())
+            samples_beta_lang = perturbed_score.annealed_langevin_sampling(num_samples,x_o_long_full,num_langevin_steps,num_time_steps,h,error_lda)[:,0,:]
+            cov_est = torch.cov(samples_beta_lang.T)
+            wass = wasserstein_dist(mu_post_n,torch.mean(samples_beta_lang,dim=0),cov_post_n,cov_est)**0.5
+            plot_final_wass_lang.append(wass.item())
+
+            #for langevin bound
+            B_t = 1.65*torch.tensor(smooth)/torch.tensor(concave)*h**0.5*DIM**0.5+error/torch.tensor(concave)
+            factor_1_lang = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(1,len(tmp_time_steps)+1))
+            factor_2_lang = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(len(tmp_time_steps)))
+            theo_bound = torch.sum(factor_1_lang*torch.tensor(list_wass_interm))+torch.sum(factor_2_lang*B_t)
+            plot_bound_lang.append(theo_bound)
+            #for diffusion bound
+            factor_2_1 = error*int_beta
+            bound = init_error + torch.sum(num/denom*(factor_1+factor_2_1+factor_2_2*(factor_3+factor_4)))
+            plot_bound.append(bound.item())
+
+        fig1,ax1 = plt.subplots(1,1,figsize=(13.5,10))
+        
+        plt.suptitle(fr"Dependence in score error $\epsilon_\text{{DSM}}$, $n={n_obs}$,  $d={DIM}$, Langevin : $h_l={step_size}$, $k={num_langevin_steps}$, $T_l={num_time_steps}$, Diffusion : $T_d={num_diffusion_steps}$, $h_d={step_size}$")
+        ax1.loglog(error_list,plot_final_wass, color="blue", label="diffusion empirical")
+        ax1.loglog(error_list,plot_final_wass_lang, color="red", label="langevin empirical")
+        ax1.plot(error_list,plot_bound, color="blue", ls="dashed",label="diffusion theoretical")
+        ax1.plot(error_list,plot_bound_lang, color="red",ls="dashed", label="langevin theoretical")
+        ax1.set_ylabel(r"$\mathcal{W}^2_2(\rho_0,\pi_0)$",fontsize=12)
+        ax1.set_xlabel(r"$\epsilon_\text{DSM}$",fontsize=12)
+        plt.legend()
+        plt.show()
+        print(o)
+    
+    if 1:#compar julia geffner diffusion langevin compositional error
+        n_obs = cfg.nextra
+        extra_obs = [x_o]
+        for _ in range(n_obs):
+            extra_obs.append(simulator1(beta_o))
+        x_o_long_full = torch.stack(extra_obs)
+        print("\nDimensions for ", n_obs+1," observations","\n x : ",x_o_long_full.size())
+        n_obs = len(x_o_long_full)
+
+        eps_lda = 0.0 #covariance error for prior
+        error_lda = 0.0 #error for prior score
+        error_list = torch.linspace(0.01,0.5,20)
+        num_diffusion_steps = 1000
+        num_time_steps = 400 #for langevin
+        step_size = 1.0/num_diffusion_steps #for diffusion constant step size
+        mu_post_n = mu_tall_post(x_o_long_full).squeeze(1)
+        cov_post_n = cov_tall_post(x_o_long_full)
+        mu_post_full = []
+        eps_max_list = []
+        list_prec_tmp = []
+        perturbed_score.error = 0.0
+        for x in x_o_long_full:
+            mu_post_full.append(mu_post(x)[0,:,0])
+            samples_indiv = perturbed_score.sampling(num_samples,steps=200, condition=x[None,:])[:,0,:] #size (num_samples, 1, dim)
+            cov_est = torch.cov(samples_indiv.T)
+            prec_est = torch.linalg.inv(cov_est)
+            eps = torch.linalg.norm(prec_est-prec_post,2)
+            list_prec_tmp.append(prec_est)
+            eps_max_list.append(eps.item())
+        eps = torch.max(torch.tensor(eps_max_list)) #take the max prec error on all
+        tmp_time_steps = torch.linspace(perturbed_score.t_min,perturbed_score.t_max,num_time_steps)# goes from 0 to T-1 for langevin
+        diff_time_steps = torch.linspace(perturbed_score.t_min,perturbed_score.t_max,num_diffusion_steps)# goes from 0 to T-1 for langevin
+        
+        alpha_fn = perturbed_score.mean_t
+        T = 1.0 #for diffusion
+        num_langevin_steps = 5
+        h = 1e-3 #step size for langevin
+        true_samples = torch.distributions.MultivariateNormal(mu_post_n, cov_post_n).sample((num_samples,))
+        
+        #for diffusion bound
+        m_0 = torch.min(torch.linalg.eigvals(torch.linalg.inv(cov_post_n)).real) #strongly concave for target pi
+        L_0 = torch.linalg.norm(torch.linalg.inv(cov_post_n),2) #smooth for target pi
+        if L_0<1:
+            L_0=1
+        a = torch.linalg.norm(-perturbed_score.beta_max*cov_post_n+(1+perturbed_score.beta_max)*torch.eye(DIM),2)
+        b = torch.linalg.norm(-perturbed_score.beta_min*cov_post_n+(1+perturbed_score.beta_min)*torch.eye(DIM),2)
+        M_1 = a.item()
+        if a.item()<b.item():
+            M_1=b.item()
+        norm_x_0 = torch.mean(torch.sum(true_samples**2,dim=1), dim=0)
+        norm_x_0 = torch.trace(cov_post_n)+torch.dot(mu_post_n,mu_post_n)
+        init_error = norm_x_0/(m_0/alpha_fn(torch.tensor([T]))**2 + 1 - m_0)
+        reverse_time = torch.flip(tmp_time_steps,dims=[0])
+        int_beta = 2*torch.log(alpha_fn(reverse_time[1:])/alpha_fn(reverse_time[:-1]))
+        int_beta_sq = perturbed_score.int_beta_sq_fn(reverse_time[:-1])-perturbed_score.int_beta_sq_fn(reverse_time[1:])
+        denom = m_0/alpha_fn(reverse_time)[1:]**2 + 1 - m_0
+        num = alpha_fn(reverse_time[1:])**(-1-2*M_1*step_size)*torch.exp((step_size/4+4*step_size*L_0**2)*perturbed_score.int_beta_sq_fn(reverse_time[1:]))[:,None]
+        factor_1 = M_1*step_size*(1+2*norm_x_0+DIM**0.5)*int_beta
+        factor_2_2 = step_size**0.5*(0.5+2*L_0)*int_beta_sq[:,None]**0.5
+        factor_3 = alpha_fn(torch.tensor([T]))*norm_x_0*(0.5+2*L_0)*int_beta
+        factor_4 = (norm_x_0**2+DIM)**0.5*0.5*int_beta+DIM**0.5*int_beta**0.5
+
+        plot_final_wass=[]
+        plot_final_wass_lang=[]
+        plot_bound=[]
+        plot_bound_lang=[]
+
+        #for annealed langevin
+        list_wass_interm = [] # W_2(pi_t, pi_t+1)
+        smooth = [] #M_t
+        concave = [] #m_t
+        
+        for i in range(len(tmp_time_steps)-1):
+            if i == 0:
+                time = tmp_time_steps[i]
+                alpha_t = perturbed_score.mean_t(time)**2
+                cov_prior_t = alpha_t*cov_prior+(1-alpha_t)*torch.eye(DIM)
+                cov_post_t = alpha_t*cov_post+(1-alpha_t)*torch.eye(DIM)
+                prec_prior_t = torch.linalg.inv(cov_prior_t)
+                prec_post_t = torch.linalg.inv(cov_post_t)
+                prec_pi_t = (1-n_obs)*prec_prior_t+n_obs*prec_post_t
+                cov_pi_t = torch.linalg.inv(prec_pi_t)
+            time_plus_1 = tmp_time_steps[i+1]
+            alpha_tp1 = perturbed_score.mean_t(time_plus_1)**2
+            cov_prior_tp1 = alpha_tp1*cov_prior+(1-alpha_tp1)*torch.eye(DIM)
+            cov_post_tp1 = alpha_tp1*cov_post+(1-alpha_tp1)*torch.eye(DIM)
+            prec_prior_tp1 = torch.linalg.inv(cov_prior_tp1)
+            prec_post_tp1 = torch.linalg.inv(cov_post_tp1)
+            prec_pi_tp1 = (1-n_obs)*prec_prior_tp1+n_obs*prec_post_tp1
+            cov_pi_tp1 = torch.linalg.inv(prec_pi_tp1)
+            if torch.min(torch.linalg.eigvals(prec_pi_t).real).item() > 0:
+                mu_t = (1-n_obs)*alpha_t**0.5*prec_prior_t@mu_prior #(2)
+                mu_tp1 = (1-n_obs)*alpha_tp1**0.5*prec_prior_tp1@mu_prior 
+                sum_t = torch.sum(prec_post_t@torch.stack(mu_post_full).T,dim=1) #(2)
+                sum_tp1 = torch.sum(prec_post_tp1@torch.stack(mu_post_full).T,dim=1)
+                mu_t = mu_t + alpha_t**0.5*sum_t
+                mu_tp1 = mu_tp1 + alpha_tp1**0.5*sum_tp1
+                mu_t = cov_pi_t@mu_t
+                mu_tp1 = cov_pi_tp1@mu_tp1
+                list_wass_interm.append(torch.sqrt(torch.clamp(wasserstein_dist(mu_t,mu_tp1,cov_pi_t,cov_pi_tp1),min=1e-12)).item())
+                m = torch.min(torch.linalg.eigvals(prec_pi_t).real) #strongly concave for pi_t
+                M = torch.linalg.norm(prec_pi_t,2) #smooth for pi_t
+                smooth.append(M)
+                concave.append(m)
+            else:
+                print("out")
+            mu_t = mu_tp1
+            cov_pi_t = cov_pi_tp1
+            prec_pi_t = prec_pi_tp1
+            # alpha_t = alpha_tp1
+
+        list_wass_interm.append((wasserstein_dist(mu_t,torch.zeros(DIM),cov_pi_t, torch.eye(DIM))**0.5).item())
+        m = torch.min(torch.linalg.eigvals(torch.linalg.inv(cov_pi_t)).real) #strongly concave for pi_t
+        M = torch.linalg.norm(torch.linalg.inv(cov_pi_t),2) #smooth for pi_t
+        smooth.append(M)
+        concave.append(m)
+
+        for error in error_list:
+            print(error)
+            perturbed_score.error=error
+            bound_compositional = perturbed_score.compositional_diffusion_error(diff_time_steps, error_lda, eps, eps_lda,list_prec_tmp, x_o_long_full)
+            samples_beta = perturbed_score.sampling(num_samples,num_diffusion_steps,x_o_long_full)[:,0,:]
+            cov_est = torch.cov(samples_beta.T)
+            wass = wasserstein_dist(mu_post_n,torch.mean(samples_beta,dim=0),cov_post_n,cov_est)**0.5
+            plot_final_wass.append(wass.item())
+            samples_beta_lang = perturbed_score.annealed_langevin_sampling(num_samples,x_o_long_full,num_langevin_steps,num_time_steps,h,error_lda)[:,0,:]
+            cov_est = torch.cov(samples_beta_lang.T)
+            wass = wasserstein_dist(mu_post_n,torch.mean(samples_beta_lang,dim=0),cov_post_n,cov_est)**0.5
+            plot_final_wass_lang.append(wass.item())
+
+            #for langevin bound
+            langevin_error = (n_obs-1)*error_lda + n_obs*error #true for all time
+            B_t = 1.65*torch.tensor(smooth)/torch.tensor(concave)*h**0.5*DIM**0.5+langevin_error/torch.tensor(concave)
+            factor_1_lang = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(1,len(tmp_time_steps)+1))
+            factor_2_lang = (1-torch.tensor(concave)*h)**(num_langevin_steps*torch.arange(len(tmp_time_steps)))
+            theo_bound = torch.sum(factor_1_lang*torch.tensor(list_wass_interm))+torch.sum(factor_2_lang*B_t)
+            plot_bound_lang.append(theo_bound)
+            #for diffusion bound
+            factor_2_1 = torch.max(torch.tensor(bound_compositional))*int_beta
+            bound = init_error + torch.sum(num/denom*(factor_1+factor_2_1+factor_2_2*(factor_3+factor_4)))
+            plot_bound.append(bound.item())
+
+        fig1,ax1 = plt.subplots(1,2,figsize=(13.5,10))
+        
+        plt.suptitle(fr"Dependence in score error $\epsilon_\text{{DSM}}$, $n={n_obs}$,  $d={DIM}$, Langevin : $h_l={step_size}$, $k={num_langevin_steps}$, $T_l={num_time_steps}$, Diffusion : $T_d={num_diffusion_steps}$, $h_d={step_size}$")
+        ax1[0].loglog(error_list,plot_final_wass, color="blue", label="diffusion empirical")
+        ax1[0].loglog(error_list,plot_final_wass_lang, color="red", label="langevin empirical")
+        ax1[0].loglog(error_list,plot_bound, color="blue", ls="dashed",label="diffusion theoretical")
+        ax1[0].loglog(error_list,plot_bound_lang, color="red",ls="dashed", label="langevin theoretical")
+        ax1[0].set_ylabel(r"$\mathcal{W}^2_2(\rho_0,\pi_0)$",fontsize=12)
+        ax1[0].set_xlabel(r"$\epsilon_\text{DSM}$",fontsize=12)
+        ax1[1].plot(error_list,plot_final_wass, color="blue", label="diffusion empirical")
+        ax1[1].plot(error_list,plot_final_wass_lang, color="red", label="langevin empirical")
+        ax1[1].plot(error_list,plot_bound, color="blue", ls="dashed",label="diffusion theoretical")
+        ax1[1].plot(error_list,plot_bound_lang, color="red",ls="dashed", label="langevin theoretical")
+        ax1[1].set_ylabel(r"$\mathcal{W}^2_2(\rho_0,\pi_0)$",fontsize=12)
+        ax1[1].set_xlabel(r"$\epsilon_\text{DSM}$",fontsize=12)
         plt.legend()
         plt.show()
         print(o)
@@ -1876,76 +2217,6 @@ def main(ctx: mlxp.Context):
 
         print(o)
 
-    if 0: #ordre de grandeur de epsilon_dsm 
-        n_obs = cfg.nextra
-        extra_obs = prior_beta.sample((n_obs,))
-        beta_o_long_full = torch.cat((beta_o.unsqueeze(0),extra_obs),dim=0)
-        x_o_long_full = simulator1(beta_o_long_full)
-        perturbed_score.error=0.0
-        time = torch.linspace(0.1,1,100)
-        epsilon_dsm = []
-        epsilon_dsm_1 = []
-        epsilon_dsm_2 = []
-        for t in time :
-            alpha_t = perturbed_score.mean_t(t)**2
-            true_samples = torch.distributions.MultivariateNormal(alpha_t**0.5*mu_tall_post(x_o_long_full).squeeze(1), alpha_t*cov_tall_post(x_o_long_full)+(1-alpha_t)*torch.eye(2)).sample((num_samples,))
-            est_score = score_estimator(true_samples, x_o, t)
-            true_score = perturbed_score.single_posterior_score(true_samples[:,None,:], x_o,t)
-            error = torch.mean(torch.linalg.norm(est_score[:,None,:]-true_score,2,dim=(1,2))**2)
-            epsilon_dsm.append(error.item())
-            est_score = score_estimator(true_samples, x_o_long_full[-1,:], t)
-            true_score = perturbed_score.single_posterior_score(true_samples[:,None,:], x_o_long_full[-1,:],t)
-            error = torch.mean(torch.linalg.norm(est_score[:,None,:]-true_score,2,dim=(1,2))**2)
-            epsilon_dsm_2.append(error.item())
-            est_score = score_estimator(true_samples, x_o_long_full[1,:], t)
-            true_score = perturbed_score.single_posterior_score(true_samples[:,None,:], x_o_long_full[1,:],t)
-            error = torch.mean(torch.linalg.norm(est_score[:,None,:]-true_score,2,dim=(1,2))**2)
-            epsilon_dsm_1.append(error.item())
-
-        plt.figure()
-        plt.plot(time,epsilon_dsm, label=r"$x_0$")
-        plt.plot(time,epsilon_dsm_1, label=r"$x_1$")
-        plt.plot(time,epsilon_dsm_2, label=r"$x_2$")
-        plt.title(f"{cfg.num_train} training data")
-        plt.legend()
-        plt.show()
-
-    if 0: #ordre de grandeur de ||\Lambda^-1||
-        n_obs = cfg.nextra
-        nobs_list = torch.arange(1,n_obs+1)
-        Lda_norm =[]
-        list_prec_post =[]
-        for _ in range(n_obs):
-            A = torch.randn(2,2)
-            D,Q = torch.linalg.eig(A+A.T)
-            from scipy.stats import truncnorm
-            mean, sd = 0, 1
-            lower, upper = -np.inf, torch.log(torch.max(torch.linalg.eigvals(cov_prior).real)).item()  # upper bound = 2
-            # Create truncated normal
-            trunc = truncnorm((lower-mean)/sd, (upper-mean)/sd, loc=mean, scale=sd)
-            eigenvalue = (torch.from_numpy(trunc.rvs(2))).float()
-            eigenvalue = torch.exp(torch.randn(2)+1)
-            cov_post_=Q.real.T @torch.diag(eigenvalue)@Q.real
-            list_prec_post.append(torch.linalg.inv(cov_post_))
-            check = torch.max(eigenvalue)<torch.max(torch.linalg.eigvals(cov_prior).real).item()
-            print("true", check)
-        list_prec_post = torch.stack(list_prec_post)
-        for n in range(n_obs):
-            # Lda_inv=torch.linalg.inv(-n*torch.linalg.inv(cov_prior)+(n+1)*prec_post)
-            # print(torch.sum(list_prec_post[:n,:,:],dim=0).shape)
-
-            Lda_inv=torch.linalg.inv(-n*torch.linalg.inv(cov_prior)+torch.sum(list_prec_post[:n+1,:,:],dim=0))
-            d= torch.linalg.eigvals(Lda_inv)
-            print("check",torch.min(d.real)>0)
-            Lda_norm.append(torch.linalg.norm(Lda_inv,2).item())
-        # Lda = torch.linalg.inv(-n_obs*diff_prec_prior+(n_obs+1)*diff_prec)
-        plt.figure()
-        plt.plot(nobs_list,Lda_norm, label=r"$\Vert\Lambda^{-1}\Vert_2$")
-        plt.plot(nobs_list,1.0/(nobs_list), label=r"$\frac{1}{n}$")
-        plt.xlabel(r"$n$")
-        plt.legend()
-        plt.show()
-        print(h)
 
     if cfg.nextra==0:#covariance bounds
         # sampling with 0 extra observation
@@ -2232,106 +2503,6 @@ def main(ctx: mlxp.Context):
         # plt.tight_layout()
 
         # plt.show()
-        
-    if 0:#for the L2 norm WITHOUT square
-        # inference with several additional observations
-        n_obs = cfg.nextra
-        extra_obs = prior_beta.sample((n_obs,))
-        beta_o_long_full = torch.cat((beta_o.unsqueeze(0),extra_obs),dim=0)
-        x_o_long_full = simulator1(beta_o_long_full)
-        print("\nDimensions for ", n_obs+1, " observations: \n beta : ", beta_o_long_full.size(),
-        "\n x : ",x_o_long_full.size())
-        eps=0.1 #error of precision matrices
-        eps_lda=0.01 #error of prior precision
-        error_lda = 0.05 #error for prior score
-
-        fig = plt.figure(figsize=(13.5,10))
-        plt.suptitle(fr"$\epsilon_{{\lambda}}={eps_lda}, \ \ \epsilon=\sup_t \sup_i ||\Sigma^{{-1}}_{{t,i}}-\tilde \Sigma^{{-1}}_{{t,i}}||\leq {eps}, \ \ \epsilon_{{\text{{DSM,}},\lambda}}=\sup_t E_{{\nu_t}}||\nabla \log p_t(\theta)-s(\theta,t)||\leq {error_lda}$")
-        colors = ["red","blue","green","orange"]
-        for k,n_obs in enumerate([2,5,7,cfg.nextra]):
-            x_o_long = x_o_long_full[:n_obs+1,:]
-            beta_o_long = beta_o_long_full[:n_obs+1,:]
-            for i, error in enumerate(error_list) :
-                tall_error_list=[]
-                error_bound_list=[]
-                Lda_error = []
-                Lda_bound = []
-                time_Lda = []
-                time_score = []
-                for time in torch.linspace(0.05,1.0,100):
-                    perturbed_score.error=0.0
-                    alpha_t = perturbed_score.mean_t(time)**2
-                    true_samples = torch.distributions.MultivariateNormal(alpha_t**0.5*mu_tall_post(x_o_long).squeeze(1), alpha_t*cov_tall_post(x_o_long)+(1-alpha_t)*torch.eye(2)).sample((num_samples,))
-                    diff_prec = perturbed_score.diff_prec(prec_post,time) #true diffused post precisions
-                    M = torch.linalg.norm(diff_prec,2) #all the cov are equal in our case
-                    diff_prec_prior = perturbed_score.diff_prec(torch.linalg.inv(cov_prior),time) #true diffused prior precision
-                    M_lda = torch.linalg.norm(diff_prec_prior,2)
-                    # Lda = torch.linalg.norm(torch.linalg.inv(-n_obs*diff_prec_prior+(n_obs+1)*diff_prec),2)
-                    Lda = torch.linalg.inv(-n_obs*diff_prec_prior+(n_obs+1)*diff_prec)
-                    norm = torch.linalg.norm(Lda,2)
-                    L=0
-                    list_prec=[] #store covariance of **perturbed** indiv posterior
-                    for j in range(n_obs+1):
-                        norm_indiv_score = torch.linalg.norm(perturbed_score.single_posterior_score(true_samples[:,None,:],x_o_long[j,:],time),2, dim=(1,2))
-                        list_prec.append(diff_prec+eps*torch.eye(2)) #Sigma tilde
-                        if L<=torch.mean(norm_indiv_score).item():
-                            L=torch.mean(norm_indiv_score).item()
-                    tilde_Lda = torch.linalg.inv(-n_obs*(diff_prec_prior+eps_lda*torch.eye(2))+torch.stack(list_prec).sum(dim=0))
-                    # test = torch.linalg.norm(Lda-tilde_Lda,2)
-                    # bound=(n_obs*eps_lda+(n_obs+1)*error)*norm**2/(1-(n_obs*eps_lda+(n_obs+1)*error)*norm)
-                    # if n_obs*eps_lda+(n_obs+1)*error<1/norm :
-                    #     time_Lda.append(time.item())
-                    #     Lda_error.append(test)
-                    #     Lda_bound.append(bound)
-
-                    L_lda = torch.mean(torch.linalg.norm(perturbed_score.prior_score(true_samples[:,None,:],time),2,dim=(1,2))) #nsamples,dim,1
-                    true_diff_tall_score = perturbed_score.tall_posterior_score(true_samples[:,None,:], x_o_long,time,[diff_prec for _ in range(n_obs+1)],diff_prec_prior)
-                    perturbed_score.error = error
-                    est_diff_tall_score = perturbed_score.tall_posterior_score(true_samples[:,None,:], x_o_long,time,list_prec,diff_prec_prior+eps_lda*torch.eye(2),error_lda)
-                    tall_error = torch.sum((true_diff_tall_score-est_diff_tall_score)**2,dim=2)**0.5 #(numsample,1)
-                    # print("hey",torch.linalg.norm(true_diff_tall_score-est_diff_tall_score,2,dim=(1,2))-tall_error[:,0])
-                    # print(est_diff_tall_score.shape, tall_error.shape,torch.linalg.norm(true_diff_tall_score-est_diff_tall_score,2,dim=(1,2)).shape)
-                    tall_error = torch.linalg.norm(true_diff_tall_score-est_diff_tall_score,2,dim=(1,2))
-                    error_bound = n_obs*(L_lda+error_lda)*norm
-                    frac = (n_obs*eps_lda+(n_obs+1)*eps)*norm/(1-norm*(n_obs*eps_lda+(n_obs+1)*eps))
-                    error_bound*=eps_lda+frac*(M_lda+eps_lda)#M_lda/(1-M_lda*eps_lda)
-                    error_bound+=(n_obs+1)*(L+error)*norm*(eps+frac*(M+eps))#*M/(1-M*eps))
-                    error_bound += norm*(n_obs*M_lda*error_lda+(n_obs+1)*M*error)
-                    if n_obs*eps_lda+(n_obs+1)*eps<1/norm :#and eps_lda<1/M_lda and eps<1/M:
-                        # print("true")
-                        # tall_error_list.append(torch.log(torch.mean(tall_error)).item())
-                        # error_bound_list.append(torch.log(error_bound).item())
-                        tall_error_list.append(torch.mean(tall_error).item())
-                        error_bound_list.append(error_bound.item())
-                        time_score.append(time.item())
-                # plt.subplot(2,2,i+1)
-                # plt.plot(time_Lda,Lda_error, color="blue", label=r"$||\Lambda_t^{-1}-\tilde \Lambda_t^{-1}||$")
-                # plt.plot(time_Lda,Lda_bound, color="red", label="analytical bound")
-                # # plt.plot(torch.linspace(1e-3,1.0,500),tall_error_list, color="blue", label=r"$\mathcal{W}_2(p,\tilde p)$")
-                # # plt.plot(torch.linspace(1e-3,1.0,500),error_bound_list, color="red", label="analytical bound")
-                # plt.xlabel(r"$t$")
-                # plt.legend()
-                # plt.title(fr"$\epsilon=||\Sigma^{{-1}}_t-\tilde \Sigma_t^{{-1}}||_2={round(error.item(),3)}$")
-
-                plt.subplot(2,2,k+1)
-                plt.plot(time_score,tall_error_list, color=colors[i], label=fr"$\epsilon_{{\text{{DSM}}}}={round(error.item(),2)}$")#label=r"$E_{\nu_t}||\nabla \log \nu_t(\theta\mid x_{1:n})-s(\theta,x_{1:n},t)||$")
-                plt.plot(time_score,error_bound_list, ls=(0,(5,5)), color=colors[i])#, label="analytical bound")
-                plt.xlabel(r"$t$", fontsize=11)
-                if k%2==0:
-                    plt.ylabel(r"$\log \sup_t E_{{\nu_t}}||\nabla \log \nu_t(\theta\mid x_{{1:n}})-s(\theta,x_{{1:n}},t)||$", fontsize=11)
-                plt.legend()
-                plt.title(rf"$n={n_obs+1}$ observations")
-            # plt.title(fr"$\sup_t \sup_i E_{{\nu_t}}||\nabla \log p_t(\theta\mid x_i)-s(\theta,x_i,t)||\leq {round(error.item(),3)}$")
-            # plt.subplot(222)
-            # plt.scatter(list_wass,list_cov_emp, color="red", marker="o",label=r"$||\Sigma_{\text{emp}}-\tilde \Sigma||_2$")
-            # # plt.plot(list_wass,list_cov_pop, color="orange",marker="o", label=r"$||\Sigma_{\text{true}}-\tilde \Sigma||_2^2$")
-            # plt.scatter(list_wass,list_cov_bound, color="green",marker="o", label="theoretical bound")
-            # plt.scatter(list_wass,list_cov_bound_prev, color="blue",marker="o", label="prev bound")
-            # ymin, ymax = plt.ylim()
-            # plt.vlines(list_wass, ymin, ymax, color="black", ls="dashed")
-        plt.tight_layout()
-        plt.show()
-        print(h)
         
     if 0:#for the L2 norm WITH square
         # inference with several additional observations
@@ -3052,7 +3223,6 @@ def main(ctx: mlxp.Context):
                     L_list = []
                     list_prec=[] #store covariance of with eps **fixed**
                     list_prec_1=[] #store **estimated** covariance of indiv posterior
-                    # print("hey", perturbed_score.error)
                     for i in range(n_obs+1):
                         norm_indiv_score = torch.linalg.norm(perturbed_score.single_posterior_score(true_samples[:,None,:],x_o_long[i,:],time),2, dim=(1,2))
                         list_prec.append(diff_prec+eps*torch.eye(2)) #Sigma tilde
